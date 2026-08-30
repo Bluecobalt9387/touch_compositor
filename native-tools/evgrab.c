@@ -20,9 +20,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     int timeout_sec = argc == 3 ? atoi(argv[2]) : 20;
-    if (timeout_sec <= 0 || timeout_sec > 120) timeout_sec = 20;
+    if (timeout_sec < 0 || timeout_sec > 86400) timeout_sec = 20;
     prctl(PR_SET_PDEATHSIG, SIGTERM);
-    alarm((unsigned)timeout_sec);
+    if (timeout_sec > 0) alarm((unsigned)timeout_sec);
 
     int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (fd < 0) die("open");

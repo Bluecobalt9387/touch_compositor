@@ -17,6 +17,21 @@ object ShellInputService {
             "monitor" -> monitor(args.drop(1))
             "tap" -> injectTap(args.drop(1))
             "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
+            "runtime" -> {
+                val a = args.drop(1)
+                require(a.size >= 7) { "runtime <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <rotation> <grabHelper> [hasPressure]" }
+                val engine = LiveTouchEngine(
+                    devicePath = a[0],
+                    rawMaxX = a[1].toInt(),
+                    rawMaxY = a[2].toInt(),
+                    displayWidth = a[3].toInt(),
+                    displayHeight = a[4].toInt(),
+                    rotation = a[5].toInt(),
+                    grabHelperPath = a[6],
+                    hasHardwarePressure = a.getOrNull(7)?.toBooleanStrictOrNull() ?: false,
+                )
+                TouchRuntimeServer(engine, a[3].toInt(), a[4].toInt(), a[5].toInt()).run()
+            }
             "record-test" -> {
                 val a = args.drop(1)
                 require(a.size >= 7) { "record-test <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <rotation> <seconds>" }
