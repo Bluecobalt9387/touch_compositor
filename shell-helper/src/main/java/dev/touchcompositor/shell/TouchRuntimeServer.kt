@@ -31,6 +31,7 @@ class TouchRuntimeServer(
     @Volatile private var currentDisplayHeight = if (initialRotation == 90 || initialRotation == 270) baseDisplayWidth else baseDisplayHeight
     @Volatile private var currentRotation = initialRotation
     @Volatile private var playbackThread: Thread? = null
+    private val playbackBusy = AtomicBoolean(false)
     @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
     private var displayWatcher: DisplayStateWatcher? = null
@@ -191,10 +192,10 @@ class TouchRuntimeServer(
             }
             "PLAY" -> {
                 require(a.size in 2..4) { "PLAY <name> [speed] [repeat]" }
-                check(playbackThread?.isAlive != true) { "playback already active" }
+                check(playbackBusy.compareAndSet(false, true)) { "playback already active" }
                 val name = sanitizeName(a[1])
-                val speed = a.getOrNull(2)?.toDouble() ?: 1.0
-                val repeat = a.getOrNull(3)?.toInt() ?: 1
+                val speed = (a.getOrNull(2)?.toDouble() ?: 1.0).also { require(it in 0.1..8.0) }
+                val repeat = (a.getOrNull(3)?.toInt() ?: 1).also { require(it in 1..10_000) }
                 val recording = FileInputStream(recordingFile(name)).use { TouchRecordingCodec.read(it) }
                 val thread = Thread({
                     try {
@@ -206,11 +207,31 @@ class TouchRuntimeServer(
                         out.println("EVENT PLAYBACK_DONE name=$name repeats=${result.completedRepeats} stopped=${result.stopped} frames=${result.emittedFrames}")
                     } catch (t: Throwable) {
                         out.println("EVENT PLAYBACK_ERROR name=$name type=${t.javaClass.simpleName} message=${(t.message ?: "").replace(' ', '_')}")
+                    } finally {
+                        playbackBusy.set(false)
                     }
                 }, "touch-compositor-player").apply { isDaemon = true }
                 playbackThread = thread
                 thread.start()
                 ok(out, "PLAYING name=$name speed=$speed repeat=$repeat")
+            }
+            "PLAY_SYNC" -> {
+                require(a.size in 2..4) { "PLAY_SYNC <name> [speed] [repeat]" }
+                check(playbackBusy.compareAndSet(false, true)) { "playback already active" }
+                val name = sanitizeName(a[1])
+                val speed = (a.getOrNull(2)?.toDouble() ?: 1.0).also { require(it in 0.1..8.0) }
+                val repeat = (a.getOrNull(3)?.toInt() ?: 1).also { require(it in 1..10_000) }
+                try {
+                    val recording = FileInputStream(recordingFile(name)).use { TouchRecordingCodec.read(it) }
+                    val result = engine.play(
+                        recording,
+                        PlaybackTarget(currentDisplayWidth, currentDisplayHeight, currentRotation),
+                        PlaybackOptions(speed = speed, repeatCount = repeat),
+                    )
+                    ok(out, "PLAYBACK_DONE name=$name repeats=${result.completedRepeats} stopped=${result.stopped} frames=${result.emittedFrames}")
+                } finally {
+                    playbackBusy.set(false)
+                }
             }
             "PAUSE" -> { engine.pausePlayback(); ok(out, "PAUSED") }
             "RESUME" -> { engine.resumePlayback(); ok(out, "RESUMED") }
