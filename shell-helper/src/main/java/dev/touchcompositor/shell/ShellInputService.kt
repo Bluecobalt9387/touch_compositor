@@ -24,9 +24,9 @@ object ShellInputService {
                     devicePath = a[0],
                     rawMaxX = a[1].toInt(),
                     rawMaxY = a[2].toInt(),
-                    displayWidth = a[3].toInt(),
-                    displayHeight = a[4].toInt(),
-                    rotation = a[5].toInt(),
+                    baseDisplayWidth = a[3].toInt(),
+                    baseDisplayHeight = a[4].toInt(),
+                    initialRotation = a[5].toInt(),
                     grabHelperPath = a[6],
                     hasHardwarePressure = a.getOrNull(7)?.toBooleanStrictOrNull() ?: false,
                 )
@@ -77,12 +77,12 @@ object ShellInputService {
                 require(a.size >= 6) { "runtime-tcp <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port]" }
                 LiveTouchEngine(
                     devicePath = a[0], rawMaxX = a[1].toInt(), rawMaxY = a[2].toInt(),
-                    displayWidth = a[3].toInt(), displayHeight = a[4].toInt(), rotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
+                    baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(), initialRotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
                     grabHelperPath = a[5],
                 ).let { engine ->
                     TouchRuntimeServer(
-                        engine = engine, displayWidth = a[3].toInt(), displayHeight = a[4].toInt(),
-                        rotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
+                        engine = engine, baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(),
+                        initialRotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
                     ).runTcp(a.getOrNull(7)?.toIntOrNull() ?: TouchRuntimeServer.DEFAULT_PORT)
                 }
             }

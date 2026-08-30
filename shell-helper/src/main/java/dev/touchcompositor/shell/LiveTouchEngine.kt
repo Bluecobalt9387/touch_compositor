@@ -33,9 +33,9 @@ class LiveTouchEngine(
     private val devicePath: String,
     private val rawMaxX: Int,
     private val rawMaxY: Int,
-    private val displayWidth: Int,
-    private val displayHeight: Int,
-    private val rotation: Int,
+    private val baseDisplayWidth: Int,
+    private val baseDisplayHeight: Int,
+    initialRotation: Int,
     private val grabHelperPath: String,
     private val hasHardwarePressure: Boolean = false,
     private val sink: TouchFrameSink = AndroidTouchFrameSink(),
@@ -88,6 +88,9 @@ class LiveTouchEngine(
     )
 
     private val lock = Any()
+    private var displayWidth = if (initialRotation == 90 || initialRotation == 270) baseDisplayHeight else baseDisplayWidth
+    private var displayHeight = if (initialRotation == 90 || initialRotation == 270) baseDisplayWidth else baseDisplayHeight
+    private var displayRotation = initialRotation
     private val allocator = PointerIdAllocator(32)
     private val rawSlots = linkedMapOf<Int, RawContact>()
     private val physical = linkedMapOf<Int, ActivePointer>() // key = evdev slot
@@ -240,25 +243,60 @@ class LiveTouchEngine(
     }
 
     private fun RawContact.toPointerState(androidId: Int): PointerState {
+        val u = x.toFloat() / (rawMaxX + 1).toFloat()
+        val v = y.toFloat() / (rawMaxY + 1).toFloat()
+        val (logicalX, logicalY) = when (displayRotation) {
+            0 -> u * displayWidth to v * displayHeight
+            90 -> (1f - v) * displayWidth to u * displayHeight
+            180 -> (1f - u) * displayWidth to (1f - v) * displayHeight
+            270 -> v * displayWidth to (1f - u) * displayHeight
+            else -> error("unsupported display rotation $displayRotation")
+        }
+        return pointerState(androidId, logicalX, logicalY)
+    }
+
+    /** Canonical natural-orientation coordinates used by recordings. */
+    private fun RawContact.toNaturalPointerState(androidId: Int): PointerState {
+        val x = this.x.toFloat() * baseDisplayWidth / (rawMaxX + 1).toFloat()
+        val y = this.y.toFloat() * baseDisplayHeight / (rawMaxY + 1).toFloat()
+        return pointerState(androidId, x, y)
+    }
+
+    private fun RawContact.pointerState(androidId: Int, x: Float, y: Float): PointerState {
         val majorPx = max(1, major).toFloat()
         val minorPx = max(1, minor).toFloat()
-        val p = if (pressure > 0) {
-            pressure.toFloat().coerceAtLeast(0f)
-        } else {
-            (majorPx / 31f).coerceIn(0.05f, 1f)
-        }
+        val p = if (pressure > 0) pressure.toFloat().coerceAtLeast(0f)
+        else (majorPx / 31f).coerceIn(0.05f, 1f)
         return PointerState(
-            id = androidId,
-            x = x.toFloat() * displayWidth / (rawMaxX + 1).toFloat(),
-            y = y.toFloat() * displayHeight / (rawMaxY + 1).toFloat(),
-            pressure = p,
-            size = (majorPx / 31f).coerceIn(0.01f, 1f),
-            touchMajor = majorPx,
-            touchMinor = minorPx,
-            toolMajor = majorPx,
-            toolMinor = minorPx,
+            id = androidId, x = x, y = y,
+            pressure = p, size = (majorPx / 31f).coerceIn(0.01f, 1f),
+            touchMajor = majorPx, touchMinor = minorPx,
+            toolMajor = majorPx, toolMinor = minorPx,
             origin = PointerOrigin.PHYSICAL,
         )
+    }
+
+    fun updateDisplay(width: Int, height: Int, rotation: Int) {
+        require(width > 0 && height > 0)
+        require(rotation in setOf(0, 90, 180, 270))
+        synchronized(lock) {
+            if (displayWidth == width && displayHeight == height && displayRotation == rotation) return
+            // Android cancels active gestures across a display rotation. Mirror that
+            // behavior, then the next evdev SYN_REPORT re-acquires held fingers.
+            if (combinedStates().isNotEmpty()) {
+                runCatching {
+                    sink.emit(ComposedFrame(TouchAction.CANCEL, combinedStates(), combinedStates().first().id, System.nanoTime()))
+                }
+                player.stop()
+                physical.clear()
+                synthetic.clear()
+                playback.clear()
+                allocator.reset()
+            }
+            displayWidth = width
+            displayHeight = height
+            displayRotation = rotation
+        }
     }
 
     override fun down(pointerId: Int, x: Float, y: Float, attributes: TouchAttributes) {
@@ -394,7 +432,7 @@ class LiveTouchEngine(
 
     private fun recordingStates(): List<PointerState> = recordingActive.values
         .sortedBy { it.slot }
-        .map { it.toPointerState(it.slot) }
+        .map { it.toNaturalPointerState(it.slot) }
 
     override fun play(
         recording: TouchRecording,
@@ -510,7 +548,7 @@ class LiveTouchEngine(
     }
 
     fun status(): String = synchronized(lock) {
-        "physical=${physical.size} synthetic=${synthetic.size} playback=${playback.size} recording=${recorder != null} player=${player.state}"
+        "physical=${physical.size} synthetic=${synthetic.size} playback=${playback.size} recording=${recorder != null} player=${player.state} display=${displayWidth}x${displayHeight} rotation=$displayRotation"
     }
 
     override fun close() {

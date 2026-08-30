@@ -18,15 +18,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Fixed-command control plane for [LiveTouchEngine]. */
 class TouchRuntimeServer(
     private val engine: LiveTouchEngine,
-    private val displayWidth: Int,
-    private val displayHeight: Int,
-    private val rotation: Int,
+    private val baseDisplayWidth: Int,
+    private val baseDisplayHeight: Int,
+    initialRotation: Int,
 ) {
     companion object {
         const val DEFAULT_PORT = 28183
     }
 
     private var recordingName: String? = null
+    @Volatile private var currentDisplayWidth = if (initialRotation == 90 || initialRotation == 270) baseDisplayHeight else baseDisplayWidth
+    @Volatile private var currentDisplayHeight = if (initialRotation == 90 || initialRotation == 270) baseDisplayWidth else baseDisplayHeight
+    @Volatile private var currentRotation = initialRotation
     @Volatile private var playbackThread: Thread? = null
     @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
@@ -93,6 +96,18 @@ class TouchRuntimeServer(
             "CAPS" -> with(engine.capabilities) {
                 ok(out, "read=$canReadPhysicalTouch grab=$canGrabPhysicalTouch inject=$canInjectTouch compose=$canComposePhysicalAndSynthetic max=$maxPointers pressure=$hasHardwarePressure")
             }
+            "DISPLAY" -> {
+                require(a.size == 4) { "DISPLAY <width> <height> <rotation>" }
+                val width = a[1].toInt()
+                val height = a[2].toInt()
+                val rotation = a[3].toInt()
+                require(rotation in setOf(0, 90, 180, 270)) { "rotation must be 0/90/180/270" }
+                engine.updateDisplay(width, height, rotation)
+                currentDisplayWidth = width
+                currentDisplayHeight = height
+                currentRotation = rotation
+                ok(out, "DISPLAY ${width}x${height} rotation=$rotation")
+            }
             "DOWN", "MOVE", "UP" -> {
                 require(a.size in 4..10) { "${a[0]} <id> <x> <y> [pressure size touchMajor touchMinor toolMajor toolMinor]" }
                 val id = a[1].toInt()
@@ -128,7 +143,9 @@ class TouchRuntimeServer(
                 require(a.size <= 2) { "RECORD_START [name]" }
                 check(recordingName == null) { "recording already active" }
                 val name = sanitizeName(a.getOrNull(1) ?: "latest")
-                engine.startRecording(RecordingMetadata(displayWidth, displayHeight, rotation))
+                // Record raw physical motion in the device's natural orientation.
+                // Playback rotates it into the current target orientation.
+                engine.startRecording(RecordingMetadata(baseDisplayWidth, baseDisplayHeight, 0))
                 recordingName = name
                 ok(out, "RECORDING name=$name")
             }
@@ -181,7 +198,7 @@ class TouchRuntimeServer(
                     try {
                         val result = engine.play(
                             recording,
-                            PlaybackTarget(displayWidth, displayHeight, rotation),
+                            PlaybackTarget(currentDisplayWidth, currentDisplayHeight, currentRotation),
                             PlaybackOptions(speed = speed, repeatCount = repeat),
                         )
                         out.println("EVENT PLAYBACK_DONE name=$name repeats=${result.completedRepeats} stopped=${result.stopped} frames=${result.emittedFrames}")

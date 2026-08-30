@@ -2,6 +2,7 @@ package dev.touchcompositor.app
 
 import android.app.Service
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -74,7 +75,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_HIDE -> removeAllWindows()
-            else -> if (Settings.canDrawOverlays(this)) showBall() else stopSelf()
+            else -> if (Settings.canDrawOverlays(this)) {
+                syncDisplayConfig()
+                showBall()
+            } else stopSelf()
         }
         return START_STICKY
     }
@@ -100,8 +104,52 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onConnected(ready: String) {
         main.post {
             runtimeStatus = ready.removePrefix("READY touch-runtime-v1 ")
+            syncDisplayConfig()
             refreshPanelIfShown()
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        main.post {
+            syncDisplayConfig()
+            when {
+                recordingStopView != null -> repositionRecordingStop()
+                panelView != null -> showPanel()
+                ballView != null -> { hideBall(); showBall() }
+            }
+        }
+    }
+
+    private fun syncDisplayConfig() {
+        if (!client.isConnected) return
+        val metrics = resources.displayMetrics
+        val rotation = when (wm.defaultDisplay.rotation) {
+            0 -> 0
+            1 -> 90
+            2 -> 180
+            3 -> 270
+            else -> 0
+        }
+        requestAsync("DISPLAY ${metrics.widthPixels} ${metrics.heightPixels} $rotation") { response ->
+            runtimeStatus = response
+            refreshPanelIfShown()
+        }
+    }
+
+    private fun repositionRecordingStop() {
+        if (!recording) return
+        val name = activeRecordingName ?: return
+        val w = dp(126)
+        val h = dp(48)
+        val right = dp(16)
+        val top = dp(78)
+        removeRecordingStop()
+        showRecordingStop(name, w, h, right, top)
+        val screenW = resources.displayMetrics.widthPixels
+        val leftPx = screenW - right - w
+        val rightPx = screenW - right
+        requestAsync("RECORD_EXCLUDE $leftPx $top $rightPx ${top + h}") {}
     }
 
     override fun onDisconnected(message: String) {
