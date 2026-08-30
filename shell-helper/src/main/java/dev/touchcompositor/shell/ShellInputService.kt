@@ -30,7 +30,7 @@ object ShellInputService {
                     grabHelperPath = a[6],
                     hasHardwarePressure = a.getOrNull(7)?.toBooleanStrictOrNull() ?: false,
                 )
-                TouchRuntimeServer(engine, a[3].toInt(), a[4].toInt(), a[5].toInt()).run()
+                TouchRuntimeServer(engine, a[3].toInt(), a[4].toInt(), a[5].toInt()).runStdio()
             }
             "record-test" -> {
                 val a = args.drop(1)
@@ -71,6 +71,20 @@ object ShellInputService {
                     grabHelperPath = a[5],
                     demoVirtualTap = args.firstOrNull() == "replay-demo",
                 ).run()
+            }
+            "runtime-tcp" -> {
+                val a = args.drop(1)
+                require(a.size >= 6) { "runtime-tcp <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port]" }
+                LiveTouchEngine(
+                    devicePath = a[0], rawMaxX = a[1].toInt(), rawMaxY = a[2].toInt(),
+                    displayWidth = a[3].toInt(), displayHeight = a[4].toInt(), rotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
+                    grabHelperPath = a[5],
+                ).let { engine ->
+                    TouchRuntimeServer(
+                        engine = engine, displayWidth = a[3].toInt(), displayHeight = a[4].toInt(),
+                        rotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
+                    ).runTcp(a.getOrNull(7)?.toIntOrNull() ?: TouchRuntimeServer.DEFAULT_PORT)
+                }
             }
             else -> println("touch_compositor shell helper: ready")
         }
