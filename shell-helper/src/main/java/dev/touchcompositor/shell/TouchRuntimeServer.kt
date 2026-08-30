@@ -28,6 +28,7 @@ class TouchRuntimeServer(
 
     private var recordingName: String? = null
     @Volatile private var playbackThread: Thread? = null
+    @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
 
     fun runStdio() {
@@ -46,6 +47,7 @@ class TouchRuntimeServer(
         require(port in 1024..65535)
         engine.start()
         ServerSocket(port, 8, InetAddress.getByName("127.0.0.1")).use { server ->
+            serverSocket = server
             println("TCP_READY host=127.0.0.1 port=$port")
             System.out.flush()
             while (!shuttingDown.get()) {
@@ -56,6 +58,7 @@ class TouchRuntimeServer(
                 }
             }
         }
+        serverSocket = null
         closeEngine(PrintWriter(System.out, true))
     }
 
@@ -107,6 +110,20 @@ class TouchRuntimeServer(
                 engine.cancelAll()
                 ok(out, "RELEASED")
             }
+            "RECORD_EXCLUDE_CLEAR" -> {
+                engine.setRecordingExclusions(emptyList())
+                ok(out, "RECORD_EXCLUSIONS 0")
+            }
+            "RECORD_EXCLUDE" -> {
+                require(a.size >= 5 && (a.size - 1) % 4 == 0) {
+                    "RECORD_EXCLUDE <left> <top> <right> <bottom> [...]"
+                }
+                val rects = a.drop(1).chunked(4).map { v ->
+                    LiveTouchEngine.RecordingRect(v[0].toFloat(), v[1].toFloat(), v[2].toFloat(), v[3].toFloat())
+                }
+                engine.setRecordingExclusions(rects)
+                ok(out, "RECORD_EXCLUSIONS ${rects.size}")
+            }
             "RECORD_START" -> {
                 require(a.size <= 2) { "RECORD_START [name]" }
                 check(recordingName == null) { "recording already active" }
@@ -134,6 +151,24 @@ class TouchRuntimeServer(
                 val file = recordingFile(name)
                 check(!file.exists() || file.delete()) { "delete failed" }
                 ok(out, "DELETED name=$name")
+            }
+            "RENAME" -> {
+                require(a.size == 3) { "RENAME <old> <new>" }
+                val oldName = sanitizeName(a[1])
+                val newName = sanitizeName(a[2])
+                check(recordingName != oldName) { "cannot rename active recording" }
+                val oldFile = recordingFile(oldName)
+                val newFile = recordingFile(newName)
+                check(oldFile.isFile) { "recording not found" }
+                check(!newFile.exists()) { "target recording already exists" }
+                check(oldFile.renameTo(newFile)) { "rename failed" }
+                ok(out, "RENAMED old=$oldName new=$newName")
+            }
+            "INFO" -> {
+                require(a.size == 2) { "INFO <name>" }
+                val name = sanitizeName(a[1])
+                val recording = FileInputStream(recordingFile(name)).use { TouchRecordingCodec.read(it) }
+                ok(out, "RECORDING name=$name frames=${recording.frames.size} durationNanos=${recording.durationNanos}")
             }
             "PLAY" -> {
                 require(a.size in 2..4) { "PLAY <name> [speed] [repeat]" }
@@ -164,6 +199,7 @@ class TouchRuntimeServer(
             "SHUTDOWN" -> {
                 ok(out, "SHUTTING_DOWN")
                 shuttingDown.set(true)
+                runCatching { serverSocket?.close() }
                 return false
             }
             else -> error("unknown command ${a[0]}")

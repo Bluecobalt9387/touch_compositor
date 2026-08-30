@@ -73,6 +73,11 @@ class LiveTouchEngine(
         var trackingId: Int = -1,
     )
 
+    data class RecordingRect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
+        init { require(left <= right && top <= bottom) }
+        fun contains(x: Float, y: Float): Boolean = x in left..right && y in top..bottom
+    }
+
     override val capabilities = TouchCapabilities(
         canReadPhysicalTouch = true,
         canGrabPhysicalTouch = true,
@@ -96,6 +101,10 @@ class LiveTouchEngine(
 
     private var recorder: TouchRecorder? = null
     private var recordingMetadata: RecordingMetadata? = null
+    private val recordingExclusions = mutableListOf<RecordingRect>()
+    private val recordingRawLast = linkedMapOf<Int, RawContact>()
+    private val recordingActive = linkedMapOf<Int, RawContact>()
+    private val recordingExcludedSlots = mutableSetOf<Int>()
     private val player = TouchPlayer()
 
     val isRunning: Boolean get() = running.get()
@@ -176,6 +185,8 @@ class LiveTouchEngine(
             .associateByTo(linkedMapOf()) { it.slot }
             .mapValuesTo(linkedMapOf()) { it.value.copy() }
 
+        recordRawPhysical(current, now)
+
         val removed = physical.keys.toList().filter { slot ->
             val p = physical[slot]
             val c = current[slot]
@@ -193,7 +204,6 @@ class LiveTouchEngine(
             val points = combinedStates()
             val action = if (points.size == 1) TouchAction.UP else TouchAction.POINTER_UP
             emitCombined(action, p.androidId, now, points)
-            recordPhysical(actionForPhysicalUp(), p.androidId, now)
             physical.remove(slot)
             allocator.release(PointerOrigin.PHYSICAL, slot)
             emittedIdentity = true
@@ -221,21 +231,13 @@ class LiveTouchEngine(
             val points = combinedStates()
             val action = if (points.size == 1) TouchAction.DOWN else TouchAction.POINTER_DOWN
             emitCombined(action, androidId, now, points)
-            recordPhysical(actionForPhysicalDown(), androidId, now)
             emittedIdentity = true
         }
 
         if (!emittedIdentity && physical.isNotEmpty()) {
             emitCombined(TouchAction.MOVE, physical.values.first().androidId, now)
-            recordPhysical(TouchAction.MOVE, physical.values.first().androidId, now)
         }
     }
-
-    private fun actionForPhysicalDown(): TouchAction =
-        if (physical.size == 1) TouchAction.DOWN else TouchAction.POINTER_DOWN
-
-    private fun actionForPhysicalUp(): TouchAction =
-        if (physical.size == 1) TouchAction.UP else TouchAction.POINTER_UP
 
     private fun RawContact.toPointerState(androidId: Int): PointerState {
         val majorPx = max(1, major).toFloat()
@@ -299,33 +301,100 @@ class LiveTouchEngine(
         synchronized(lock) { releaseOrigin(PointerOrigin.SYNTHETIC, System.nanoTime()) }
     }
 
+    fun setRecordingExclusions(rects: List<RecordingRect>) {
+        synchronized(lock) {
+            recordingExclusions.clear()
+            recordingExclusions.addAll(rects)
+        }
+    }
+
     override fun startRecording(metadata: RecordingMetadata) {
         synchronized(lock) {
             check(recorder == null) { "already recording" }
             check(physical.isEmpty()) { "lift physical fingers before starting a recording" }
             recorder = TouchRecorder().also { it.start(metadata, System.nanoTime()) }
             recordingMetadata = metadata
+            recordingRawLast.clear()
+            recordingActive.clear()
+            recordingExcludedSlots.clear()
         }
     }
 
     override fun stopRecording(): TouchRecording = synchronized(lock) {
         val r = recorder ?: error("not recording")
         val now = System.nanoTime()
-        if (physical.isNotEmpty()) {
-            r.record(ComposedFrame(TouchAction.CANCEL, physicalStates(), physical.values.first().androidId, now))
+        if (recordingActive.isNotEmpty()) {
+            val states = recordingStates()
+            r.record(ComposedFrame(TouchAction.CANCEL, states, states.first().id, now))
         }
         val result = r.stop(now)
         recorder = null
         recordingMetadata = null
+        recordingRawLast.clear()
+        recordingActive.clear()
+        recordingExcludedSlots.clear()
         result
     }
 
-    private fun recordPhysical(action: TouchAction, changedPointerId: Int, now: Long) {
+    /** Recorder is driven from raw physical frames and can exclude overlay gestures cleanly. */
+    private fun recordRawPhysical(current: LinkedHashMap<Int, RawContact>, now: Long) {
         val r = recorder ?: return
-        val points = physicalStates()
-        if (points.isEmpty()) return
-        r.record(ComposedFrame(action, points, changedPointerId, now))
+        val removed = recordingRawLast.keys.toList().filter { slot ->
+            val old = recordingRawLast[slot]
+            val cur = current[slot]
+            cur == null || cur.trackingId != old?.trackingId
+        }
+        val added = current.keys.toList().filter { slot ->
+            val old = recordingRawLast[slot]
+            val cur = current[slot]
+            old == null || old.trackingId != cur?.trackingId
+        }
+        var emittedIdentity = false
+
+        for (slot in removed.sortedByDescending { recordingActive.keys.toList().indexOf(it) }) {
+            if (slot in recordingExcludedSlots) {
+                recordingExcludedSlots.remove(slot)
+                continue
+            }
+            if (!recordingActive.containsKey(slot)) continue
+            val states = recordingStates()
+            val action = if (states.size == 1) TouchAction.UP else TouchAction.POINTER_UP
+            r.record(ComposedFrame(action, states, slot, now))
+            recordingActive.remove(slot)
+            emittedIdentity = true
+        }
+
+        current.forEach { (slot, raw) ->
+            val prev = recordingActive[slot]
+            if (prev != null && prev.trackingId == raw.trackingId) recordingActive[slot] = raw.copy()
+        }
+
+        for (slot in added.sorted()) {
+            val raw = current[slot] ?: continue
+            val state = raw.toPointerState(slot)
+            if (recordingExclusions.any { it.contains(state.x, state.y) }) {
+                recordingExcludedSlots += slot
+                continue
+            }
+            recordingActive[slot] = raw.copy()
+            val states = recordingStates()
+            val action = if (states.size == 1) TouchAction.DOWN else TouchAction.POINTER_DOWN
+            r.record(ComposedFrame(action, states, slot, now))
+            emittedIdentity = true
+        }
+
+        if (!emittedIdentity && recordingActive.isNotEmpty()) {
+            val states = recordingStates()
+            r.record(ComposedFrame(TouchAction.MOVE, states, states.first().id, now))
+        }
+
+        recordingRawLast.clear()
+        current.forEach { (slot, raw) -> recordingRawLast[slot] = raw.copy() }
     }
+
+    private fun recordingStates(): List<PointerState> = recordingActive.values
+        .sortedBy { it.slot }
+        .map { it.toPointerState(it.slot) }
 
     override fun play(
         recording: TouchRecording,
@@ -466,6 +535,9 @@ class LiveTouchEngine(
             allocator.reset()
             recorder?.cancel()
             recorder = null
+            recordingRawLast.clear()
+            recordingActive.clear()
+            recordingExcludedSlots.clear()
         }
         runCatching { process?.destroy() }
         runCatching { readerThread?.join(1000) }
