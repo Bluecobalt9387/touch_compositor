@@ -1,15 +1,15 @@
 package dev.touchcompositor.shell
 
-import android.hardware.input.InputManager
 import android.os.SystemClock
-import android.view.InputEvent
-import android.view.MotionEvent
 import java.io.BufferedInputStream
 import java.io.FileOutputStream
 import java.io.PrintWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.max
+import dev.touchcompositor.input.ComposedFrame
+import dev.touchcompositor.input.PointerOrigin
+import dev.touchcompositor.input.PointerState
+import dev.touchcompositor.input.TouchAction
 
 /**
  * Experimental Type-B evdev -> MotionEvent replay backend.
@@ -34,8 +34,6 @@ class EvdevReplayCompositor(
         private const val ABS_MT_POSITION_X = 0x35
         private const val ABS_MT_POSITION_Y = 0x36
         private const val ABS_MT_TRACKING_ID = 0x39
-        private const val SOURCE_TOUCHSCREEN = 0x1002
-        private const val INJECT_WAIT_FOR_RESULT = 1
     }
 
     data class Contact(
@@ -53,7 +51,6 @@ class EvdevReplayCompositor(
     private val slots = linkedMapOf<Int, Contact>()
     private var previous = linkedMapOf<Int, Contact>()
     private var currentSlot = 0
-    private var downTime = 0L
     private var frame = 0L
     private val virtualSlot = 19
     private var virtualActive = false
@@ -61,7 +58,7 @@ class EvdevReplayCompositor(
     private var virtualDownAt = 0L
     private var virtualTriggered = false
 
-    private val injector by lazy { InputInjectorCompat() }
+    private val sink by lazy { AndroidTouchFrameSink() }
 
     fun run() {
         val process = ProcessBuilder(grabHelperPath, devicePath, "60")
@@ -142,7 +139,6 @@ class EvdevReplayCompositor(
             injectPointerUp(combinedPoints(), slot)
             previous.remove(slot)
             emittedIdentityAction = true
-            if (combinedPoints().isEmpty()) downTime = 0L
         }
 
         current.forEach { (k, v) ->
@@ -154,7 +150,6 @@ class EvdevReplayCompositor(
         for (slot in added.sorted()) {
             val c = current[slot] ?: continue
             previous[slot] = c.copyContact()
-            if (combinedPoints().size == 1) downTime = SystemClock.uptimeMillis()
             injectPointerDown(combinedPoints(), slot)
             emittedIdentityAction = true
         }
@@ -179,16 +174,14 @@ class EvdevReplayCompositor(
             virtualActive = false
             log.println("DEMO_VIRTUAL_UP slot=$virtualSlot")
             emittedIdentityAction = true
-            if (combinedPoints().isEmpty()) downTime = 0L
         }
 
         if (!emittedIdentityAction && combinedPoints().isNotEmpty()) {
-            injectMotion(combinedPoints(), MotionEvent.ACTION_MOVE)
+            injectMotion(combinedPoints(), 2)
         }
 
         if (current.isEmpty() && !virtualActive) {
             previous.clear()
-            downTime = 0L
         }
 
         if (frame % 120L == 0L) {
@@ -213,86 +206,52 @@ class EvdevReplayCompositor(
     }
 
     private fun injectPointerDown(points: LinkedHashMap<Int, Contact>, addedSlot: Int) {
-        val sorted = points.values.sortedBy { it.slot }
-        val action = if (sorted.size == 1) {
-            MotionEvent.ACTION_DOWN
-        } else {
-            val index = sorted.indexOfFirst { it.slot == addedSlot }
-            MotionEvent.ACTION_POINTER_DOWN or (index shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
-        }
-        injectMotion(points, action)
+        val action = if (points.size == 1) TouchAction.DOWN else TouchAction.POINTER_DOWN
+        emit(points, action, addedSlot)
     }
 
     private fun injectPointerUp(points: LinkedHashMap<Int, Contact>, removedSlot: Int) {
-        val sorted = points.values.sortedBy { it.slot }
-        if (sorted.isEmpty()) return
-        val action = if (sorted.size == 1) {
-            MotionEvent.ACTION_UP
-        } else {
-            val index = sorted.indexOfFirst { it.slot == removedSlot }
-            MotionEvent.ACTION_POINTER_UP or (max(index, 0) shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
-        }
-        injectMotion(points, action)
+        if (points.isEmpty()) return
+        val action = if (points.size == 1) TouchAction.UP else TouchAction.POINTER_UP
+        emit(points, action, removedSlot)
     }
 
     private fun injectUpAll(points: LinkedHashMap<Int, Contact>) {
         if (points.isEmpty()) return
-        // Prototype cleanup: collapse any remaining synthetic gesture with CANCEL.
-        injectMotion(points, MotionEvent.ACTION_CANCEL)
+        emit(points, TouchAction.CANCEL, points.keys.first())
     }
 
     private fun injectMotion(points: Map<Int, Contact>, action: Int): Boolean {
-        if (points.isEmpty()) return true
-        val sorted = points.values.sortedBy { it.slot }
-        val props = Array(sorted.size) { MotionEvent.PointerProperties() }
-        val coords = Array(sorted.size) { MotionEvent.PointerCoords() }
-        sorted.forEachIndexed { index, c ->
-            props[index].id = c.slot
-            props[index].toolType = MotionEvent.TOOL_TYPE_FINGER
-            coords[index].x = c.rawX.toFloat() * displayWidth.toFloat() / (rawMaxX + 1).toFloat()
-            coords[index].y = c.rawY.toFloat() * displayHeight.toFloat() / (rawMaxY + 1).toFloat()
-            coords[index].pressure = 1f
-            coords[index].size = 0.05f
-            coords[index].touchMajor = max(1, c.major).toFloat()
-            coords[index].touchMinor = max(1, c.minor).toFloat()
+        val logical = when (action) {
+            2 -> TouchAction.MOVE
+            3 -> TouchAction.CANCEL
+            else -> error("legacy action $action is not supported")
         }
-        val now = SystemClock.uptimeMillis()
-        if (downTime == 0L) downTime = now
-        val event = MotionEvent.obtain(
-            downTime,
-            now,
-            action,
-            sorted.size,
-            props,
-            coords,
-            0,
-            0,
-            1f,
-            1f,
-            6,
-            0,
-            SOURCE_TOUCHSCREEN,
-            0,
-        )
-        val masked = action and MotionEvent.ACTION_MASK
-        val shouldLog = masked != MotionEvent.ACTION_MOVE || frame % 20L == 0L
+        return emit(points, logical, points.keys.firstOrNull() ?: 0)
+    }
+
+    private fun emit(points: Map<Int, Contact>, action: TouchAction, changedPointerId: Int): Boolean {
+        if (points.isEmpty()) return action == TouchAction.CANCEL
+        val states = points.values.sortedBy { it.slot }.map { c ->
+            val major = c.major.coerceAtLeast(1).toFloat()
+            PointerState(
+                id = c.slot,
+                x = c.rawX.toFloat() * displayWidth.toFloat() / (rawMaxX + 1).toFloat(),
+                y = c.rawY.toFloat() * displayHeight.toFloat() / (rawMaxY + 1).toFloat(),
+                pressure = (major / 31f).coerceIn(0.05f, 1f),
+                size = (major / 31f).coerceIn(0.01f, 1f),
+                touchMajor = major,
+                touchMinor = c.minor.coerceAtLeast(1).toFloat(),
+                toolMajor = major,
+                toolMinor = c.minor.coerceAtLeast(1).toFloat(),
+                origin = if (c.slot == virtualSlot) PointerOrigin.SYNTHETIC else PointerOrigin.PHYSICAL,
+            )
+        }
+        val shouldLog = action != TouchAction.MOVE || frame % 20L == 0L
         if (shouldLog) {
-            val name = when (masked) {
-                MotionEvent.ACTION_DOWN -> "DOWN"
-                MotionEvent.ACTION_POINTER_DOWN -> "POINTER_DOWN"
-                MotionEvent.ACTION_MOVE -> "MOVE"
-                MotionEvent.ACTION_POINTER_UP -> "POINTER_UP"
-                MotionEvent.ACTION_UP -> "UP"
-                MotionEvent.ACTION_CANCEL -> "CANCEL"
-                else -> masked.toString()
-            }
-            val ids = sorted.joinToString(",") { it.slot.toString() }
-            log.println("OUT frame=$frame action=$name pointers=${sorted.size} ids=$ids")
+            val ids = states.joinToString(",") { it.id.toString() }
+            log.println("OUT frame=$frame action=$action pointers=${states.size} ids=$ids")
         }
-        return try {
-            injector.inject(event, INJECT_WAIT_FOR_RESULT)
-        } finally {
-            event.recycle()
-        }
+        return sink.emit(ComposedFrame(action, states, changedPointerId, System.nanoTime()))
     }
 }

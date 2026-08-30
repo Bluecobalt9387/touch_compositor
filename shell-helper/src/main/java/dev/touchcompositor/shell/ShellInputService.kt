@@ -17,6 +17,33 @@ object ShellInputService {
             "monitor" -> monitor(args.drop(1))
             "tap" -> injectTap(args.drop(1))
             "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
+            "record-test" -> {
+                val a = args.drop(1)
+                require(a.size >= 7) { "record-test <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <rotation> <seconds>" }
+                val out = "/data/local/tmp/touch_compositor_recording.tcr"
+                val recording = EvdevRecorder(
+                    devicePath = a[0],
+                    rawMaxX = a[1].toInt(),
+                    rawMaxY = a[2].toInt(),
+                    displayWidth = a[3].toInt(),
+                    displayHeight = a[4].toInt(),
+                    rotation = a[5].toInt(),
+                ).recordTo(out, a[6].toInt())
+                println("RECORDING_SAVED path=$out frames=${recording.frames.size} durationNanos=${recording.durationNanos}")
+            }
+            "play-test-recording" -> {
+                val a = args.drop(1)
+                require(a.size >= 3) { "play-test-recording <displayW> <displayH> <rotation> [speed] [repeat]" }
+                val result = RecordingPlayer.play(
+                    inputPath = "/data/local/tmp/touch_compositor_recording.tcr",
+                    displayWidth = a[0].toInt(),
+                    displayHeight = a[1].toInt(),
+                    rotation = a[2].toInt(),
+                    speed = a.getOrNull(3)?.toDoubleOrNull() ?: 1.0,
+                    repeatCount = a.getOrNull(4)?.toIntOrNull() ?: 1,
+                )
+                println("PLAYBACK_DONE repeats=${result.completedRepeats} stopped=${result.stopped} frames=${result.emittedFrames}")
+            }
             "replay", "replay-demo" -> {
                 val a = args.drop(1)
                 require(a.size >= 6) { "replay <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper>" }
