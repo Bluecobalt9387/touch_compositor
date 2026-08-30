@@ -255,13 +255,6 @@ class LiveTouchEngine(
         return pointerState(androidId, logicalX, logicalY)
     }
 
-    /** Canonical natural-orientation coordinates used by recordings. */
-    private fun RawContact.toNaturalPointerState(androidId: Int): PointerState {
-        val x = this.x.toFloat() * baseDisplayWidth / (rawMaxX + 1).toFloat()
-        val y = this.y.toFloat() * baseDisplayHeight / (rawMaxY + 1).toFloat()
-        return pointerState(androidId, x, y)
-    }
-
     private fun RawContact.pointerState(androidId: Int, x: Float, y: Float): PointerState {
         val majorPx = max(1, major).toFloat()
         val minorPx = max(1, minor).toFloat()
@@ -430,9 +423,20 @@ class LiveTouchEngine(
         current.forEach { (slot, raw) -> recordingRawLast[slot] = raw.copy() }
     }
 
-    private fun recordingStates(): List<PointerState> = recordingActive.values
-        .sortedBy { it.slot }
-        .map { it.toNaturalPointerState(it.slot) }
+    private fun recordingStates(): List<PointerState> {
+        val metadata = recordingMetadata ?: error("recording metadata missing")
+        val currentWidth = displayWidth.toFloat()
+        val currentHeight = displayHeight.toFloat()
+        return recordingActive.values
+            .sortedBy { it.slot }
+            .map { raw ->
+                val logical = raw.toPointerState(raw.slot)
+                logical.copy(
+                    x = logical.x / currentWidth * metadata.displayWidth,
+                    y = logical.y / currentHeight * metadata.displayHeight,
+                )
+            }
+    }
 
     override fun play(
         recording: TouchRecording,

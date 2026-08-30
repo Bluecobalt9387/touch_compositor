@@ -100,7 +100,7 @@ class TouchPlayer(private val clock: PlaybackClock = SystemPlaybackClock) {
                         }
                     }
                     if (stopped) break
-                    if (!sink.emit(frame.toComposedFrame(recording.metadata, target, clock.nowNanos(), origin, options.pointerIdOffset))) {
+                    if (!sink.emit(frame.toComposedFrame(target, clock.nowNanos(), origin, options.pointerIdOffset))) {
                         stopped = true
                         break
                     }
@@ -116,20 +116,17 @@ class TouchPlayer(private val clock: PlaybackClock = SystemPlaybackClock) {
 }
 
 private fun RecordedFrame.toComposedFrame(
-    source: RecordingMetadata,
     target: PlaybackTarget,
     eventTimeNanos: Long,
     origin: PointerOrigin,
     pointerIdOffset: Int,
 ): ComposedFrame {
-    val delta = ((target.rotation - source.rotation) % 360 + 360) % 360
     val scale = minOf(target.displayWidth, target.displayHeight).toFloat()
     val pointers = pointers.map { p ->
-        val (nx, ny) = rotate(p.x, p.y, delta)
         PointerState(
             id = p.id + pointerIdOffset,
-            x = nx * target.displayWidth,
-            y = ny * target.displayHeight,
+            x = p.x * target.displayWidth,
+            y = p.y * target.displayHeight,
             pressure = p.pressure,
             size = p.size,
             touchMajor = p.touchMajor * scale,
@@ -141,12 +138,4 @@ private fun RecordedFrame.toComposedFrame(
     }
     require(pointers.all { it.id in 0..31 }) { "pointer id offset exceeds Android range" }
     return ComposedFrame(action, pointers, changedPointerId + pointerIdOffset, eventTimeNanos)
-}
-
-private fun rotate(x: Float, y: Float, degrees: Int): Pair<Float, Float> = when (degrees) {
-    0 -> x to y
-    90 -> y to (1f - x)
-    180 -> (1f - x) to (1f - y)
-    270 -> (1f - y) to x
-    else -> error("invalid rotation")
 }

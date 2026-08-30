@@ -146,9 +146,8 @@ class TouchRuntimeServer(
                 require(a.size <= 2) { "RECORD_START [name]" }
                 check(recordingName == null) { "recording already active" }
                 val name = sanitizeName(a.getOrNull(1) ?: "latest")
-                // Record raw physical motion in the device's natural orientation.
-                // Playback rotates it into the current target orientation.
-                engine.startRecording(RecordingMetadata(baseDisplayWidth, baseDisplayHeight, 0))
+                // v2 recordings store normalized logical-screen coordinates.
+                engine.startRecording(RecordingMetadata(currentDisplayWidth, currentDisplayHeight, currentRotation))
                 recordingName = name
                 ok(out, "RECORDING name=$name")
             }
@@ -273,7 +272,11 @@ class TouchRuntimeServer(
     private fun recordingFile(name: String): File = File("/data/local/tmp", "touch_compositor_$name.tcr")
 
     private fun recordingFiles(): List<File> = File("/data/local/tmp").listFiles()
-        ?.filter { it.isFile && it.name.matches(Regex("touch_compositor_[A-Za-z0-9_-]{1,64}\\.tcr")) }
+        ?.filter { file ->
+            file.isFile &&
+                file.name.matches(Regex("touch_compositor_[A-Za-z0-9_-]{1,64}\\.tcr")) &&
+                FileInputStream(file).use { TouchRecordingCodec.isSupported(it) }
+        }
         ?.sortedByDescending { it.lastModified() }
         ?: emptyList()
 

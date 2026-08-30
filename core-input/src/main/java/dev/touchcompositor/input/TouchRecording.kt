@@ -5,7 +5,7 @@ data class RecordingMetadata(
     val displayWidth: Int,
     val displayHeight: Int,
     val rotation: Int = 0,
-    val formatVersion: Int = 1,
+    val formatVersion: Int = TouchRecordingCodec.FORMAT_VERSION,
 ) {
     init {
         require(displayWidth > 0 && displayHeight > 0)
@@ -13,7 +13,7 @@ data class RecordingMetadata(
     }
 }
 
-/** Coordinates and contact dimensions are normalized to the source display. */
+/** Coordinates and contact dimensions are normalized to the logical screen at each frame. */
 data class RecordedPointer(
     val id: Int,
     val x: Float,

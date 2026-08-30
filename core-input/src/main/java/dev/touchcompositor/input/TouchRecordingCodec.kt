@@ -10,8 +10,14 @@ import java.io.OutputStream
 /** Compact deterministic format intended for local recording files. */
 object TouchRecordingCodec {
     private const val MAGIC = 0x54435231 // TCR1
+    const val FORMAT_VERSION = 2
     private const val MAX_FRAMES = 10_000_000
     private const val MAX_POINTERS = 32
+
+    fun isSupported(input: InputStream): Boolean = runCatching {
+        val data = DataInputStream(input)
+        data.readInt() == MAGIC && data.readInt() == FORMAT_VERSION
+    }.getOrDefault(false)
 
     fun write(recording: TouchRecording, output: OutputStream) {
         val out = DataOutputStream(BufferedOutputStream(output))
@@ -47,7 +53,7 @@ object TouchRecordingCodec {
         val data = DataInputStream(BufferedInputStream(input))
         require(data.readInt() == MAGIC) { "not a Touch Compositor recording" }
         val version = data.readInt()
-        require(version == 1) { "unsupported recording version $version" }
+        require(version == FORMAT_VERSION) { "unsupported recording version $version" }
         val metadata = RecordingMetadata(
             displayWidth = data.readInt(),
             displayHeight = data.readInt(),

@@ -187,10 +187,19 @@ class EvdevRecorder(
         .map { c ->
             val major = c.major.coerceAtLeast(1).toFloat()
             val pressure = if (c.pressure > 0) c.pressure.toFloat() else (major / 31f).coerceIn(0.05f, 1f)
+            val u = c.x.toFloat() / (rawMaxX + 1).toFloat()
+            val v = c.y.toFloat() / (rawMaxY + 1).toFloat()
+            val (logicalX, logicalY) = when (rotation) {
+                0 -> u * displayWidth to v * displayHeight
+                90 -> v * displayWidth to (1f - u) * displayHeight
+                180 -> (1f - u) * displayWidth to (1f - v) * displayHeight
+                270 -> (1f - v) * displayWidth to u * displayHeight
+                else -> error("unsupported rotation $rotation")
+            }
             PointerState(
                 id = c.slot,
-                x = c.x.toFloat() * displayWidth / (rawMaxX + 1).toFloat(),
-                y = c.y.toFloat() * displayHeight / (rawMaxY + 1).toFloat(),
+                x = logicalX,
+                y = logicalY,
                 pressure = pressure,
                 size = (major / 31f).coerceIn(0.01f, 1f),
                 touchMajor = major,
