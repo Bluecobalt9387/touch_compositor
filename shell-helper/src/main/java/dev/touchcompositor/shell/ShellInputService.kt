@@ -17,22 +17,30 @@ object ShellInputService {
             "monitor" -> monitor(args.drop(1))
             "tap" -> injectTap(args.drop(1))
             "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
+            "replay", "replay-demo" -> {
+                val a = args.drop(1)
+                require(a.size >= 6) { "replay <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper>" }
+                EvdevReplayCompositor(
+                    devicePath = a[0],
+                    rawMaxX = a[1].toInt(),
+                    rawMaxY = a[2].toInt(),
+                    displayWidth = a[3].toInt(),
+                    displayHeight = a[4].toInt(),
+                    grabHelperPath = a[5],
+                    demoVirtualTap = args.firstOrNull() == "replay-demo",
+                ).run()
+            }
             else -> println("touch_compositor shell helper: ready")
         }
     }
 
-    private fun inputManager(): Any =
-        InputManager::class.java.getDeclaredMethod("getInstance").invoke(null)
+    private val injector by lazy { InputInjectorCompat() }
 
-    private fun inject(event: MotionEvent): Boolean {
-        val manager = inputManager()
-        val method = InputManager::class.java.getMethod(
-            "injectInputEvent",
-            InputEvent::class.java,
-            Int::class.javaPrimitiveType,
-        )
-        return method.invoke(manager, event, 1) as Boolean
-    }
+    private fun monitorInputManager(): Any =
+        InputManager::class.java.getDeclaredMethod("getInstance").invoke(null)
+            ?: error("InputManager.getInstance() unavailable for InputMonitor on this build")
+
+    private fun inject(event: MotionEvent): Boolean = injector.inject(event, 1)
 
     private fun injectTap(args: List<String>) {
         val x = args.getOrNull(0)?.toFloatOrNull() ?: error("tap <x> <y> [deviceId]")
@@ -61,7 +69,7 @@ object ShellInputService {
         Looper.prepare()
         var monitor: InputMonitor? = null
         try {
-            val manager = inputManager()
+            val manager = monitorInputManager()
             val method = InputManager::class.java.getMethod(
                 "monitorGestureInput",
                 String::class.java,
