@@ -16,6 +16,7 @@ object ShellInputService {
             "probe-input-api" -> probeInputApi()
             "monitor" -> monitor(args.drop(1))
             "tap" -> injectTap(args.drop(1))
+            "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
             else -> println("touch_compositor shell helper: ready")
         }
     }
