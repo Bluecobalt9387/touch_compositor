@@ -15,5 +15,6 @@ android {
 }
 
 dependencies {
+    compileOnly(project(":hidden-api-stubs"))
     implementation(project(":core-input"))
 }
