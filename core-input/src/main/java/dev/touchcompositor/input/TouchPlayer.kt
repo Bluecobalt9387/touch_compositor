@@ -145,8 +145,8 @@ private fun RecordedFrame.toComposedFrame(
 
 private fun rotate(x: Float, y: Float, degrees: Int): Pair<Float, Float> = when (degrees) {
     0 -> x to y
-    90 -> (1f - y) to x
+    90 -> y to (1f - x)
     180 -> (1f - x) to (1f - y)
-    270 -> y to (1f - x)
+    270 -> (1f - y) to x
     else -> error("invalid rotation")
 }

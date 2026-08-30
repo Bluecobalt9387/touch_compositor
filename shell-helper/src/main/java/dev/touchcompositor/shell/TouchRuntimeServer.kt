@@ -33,9 +33,11 @@ class TouchRuntimeServer(
     @Volatile private var playbackThread: Thread? = null
     @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
+    private var displayWatcher: DisplayStateWatcher? = null
 
     fun runStdio() {
         engine.start()
+        startDisplayWatcher()
         val out = PrintWriter(System.out, true)
         ready(out)
         try {
@@ -49,6 +51,7 @@ class TouchRuntimeServer(
     fun runTcp(port: Int = DEFAULT_PORT) {
         require(port in 1024..65535)
         engine.start()
+        startDisplayWatcher()
         ServerSocket(port, 8, InetAddress.getByName("127.0.0.1")).use { server ->
             serverSocket = server
             println("TCP_READY host=127.0.0.1 port=$port")
@@ -224,10 +227,26 @@ class TouchRuntimeServer(
         return true
     }
 
+    private fun startDisplayWatcher() {
+        displayWatcher?.close()
+        displayWatcher = DisplayStateWatcher { width, height, rotation ->
+            runCatching {
+                engine.updateDisplay(width, height, rotation)
+                currentDisplayWidth = width
+                currentDisplayHeight = height
+                currentRotation = rotation
+            }.onFailure { t ->
+                System.err.println("DISPLAY_UPDATE_ERROR ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }.also { it.start() }
+    }
+
     private fun ready(out: PrintWriter) = out.println("READY touch-runtime-v1 ${engine.status()}")
 
     private fun closeEngine(out: PrintWriter) {
         if (!shuttingDown.compareAndSet(false, true) && !shuttingDown.get()) return
+        displayWatcher?.close()
+        displayWatcher = null
         engine.stopPlayback()
         runCatching { playbackThread?.join(1000) }
         engine.close()

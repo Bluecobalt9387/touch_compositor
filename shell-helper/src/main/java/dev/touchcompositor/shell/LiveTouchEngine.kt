@@ -247,9 +247,9 @@ class LiveTouchEngine(
         val v = y.toFloat() / (rawMaxY + 1).toFloat()
         val (logicalX, logicalY) = when (displayRotation) {
             0 -> u * displayWidth to v * displayHeight
-            90 -> (1f - v) * displayWidth to u * displayHeight
+            90 -> v * displayWidth to (1f - u) * displayHeight
             180 -> (1f - u) * displayWidth to (1f - v) * displayHeight
-            270 -> v * displayWidth to (1f - u) * displayHeight
+            270 -> (1f - v) * displayWidth to u * displayHeight
             else -> error("unsupported display rotation $displayRotation")
         }
         return pointerState(androidId, logicalX, logicalY)
