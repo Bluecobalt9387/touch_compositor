@@ -8,6 +8,17 @@ import java.io.File
 
 /** Bridges product setup (ADB pairing) to the localhost touch runtime. */
 class RuntimeEnvironment(context: Context) : AutoCloseable {
+    companion object {
+        @Volatile private var sharedAdb: TouchAdbController? = null
+        private fun controller(context: Context): TouchAdbController =
+            sharedAdb ?: synchronized(this) {
+                sharedAdb ?: TouchAdbController(context.applicationContext).also {
+                    it.startDiscovery()
+                    sharedAdb = it
+                }
+            }
+    }
+
     data class Ready(
         val readyLine: String,
         val launchedNow: Boolean,
@@ -15,7 +26,7 @@ class RuntimeEnvironment(context: Context) : AutoCloseable {
     )
 
     private val appContext = context.applicationContext
-    private val adb = TouchAdbController(appContext).also { it.startDiscovery() }
+    private val adb = controller(appContext)
 
     val hasPairedIdentity: Boolean get() = adb.hasPairedIdentity
     fun discoverySnapshot(): TouchAdbController.DiscoverySnapshot = adb.discoverySnapshot()
@@ -119,5 +130,7 @@ class RuntimeEnvironment(context: Context) : AutoCloseable {
         return if (log.isBlank()) "Touch Runtime 启动超时" else "Touch Runtime 启动失败：$log"
     }
 
-    override fun close() = adb.close()
+    // The ADB connection owns the runtime shell stream and is process-scoped.
+    // Individual Activity/Service wrappers must not tear it down.
+    override fun close() = Unit
 }

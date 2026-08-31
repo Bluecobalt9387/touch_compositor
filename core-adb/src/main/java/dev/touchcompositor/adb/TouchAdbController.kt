@@ -3,7 +3,11 @@ package dev.touchcompositor.adb
 import android.content.Context
 import io.github.muntashirakon.adb.AdbStream
 import io.github.muntashirakon.adb.android.AdbMdns
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicReference
 
@@ -122,6 +126,10 @@ class TouchAdbController(context: Context) : AutoCloseable {
     private var manager = PersistentAdbConnectionManager(appContext)
     private val pairingRef = AtomicReference<Endpoint?>(null)
     private val connectRef = AtomicReference<Endpoint?>(null)
+    @Volatile private var runtimeStream: AdbStream? = null
+    @Volatile private var runtimeDrainThread: Thread? = null
+    private val runtimeOutputLock = Any()
+    private val runtimeOutput = StringBuilder()
 
     private val pairingMdns = AdbMdns(appContext, AdbMdns.SERVICE_TYPE_TLS_PAIRING) { host, port ->
         val address = host?.hostAddress
@@ -229,27 +237,34 @@ class TouchAdbController(context: Context) : AutoCloseable {
         val remoteSize = shell("wc -c < $HELPER_REMOTE").trim().toLongOrNull()
         check(remoteSize == helperFile.length()) { "helper 部署不完整" }
 
+        closeRuntimeStream()
         stopStaleRuntimeProcesses()
-        shell("rm -f $RUNTIME_LOG")
         val t = probe.touchscreen
         val command = buildString {
             append("CLASSPATH=").append(shellQuote(probe.apkPath)).append(' ')
-            append("setsid /system/bin/app_process /system/bin ")
+            append("/system/bin/app_process /system/bin ")
             append("dev.touchcompositor.shell.ShellInputService runtime-tcp ")
             append(shellQuote(t.devicePath)).append(' ')
             append(t.rawMaxX).append(' ').append(t.rawMaxY).append(' ')
             append(probe.displayWidth).append(' ').append(probe.displayHeight).append(' ')
             append(HELPER_REMOTE).append(' ').append(probe.rotation).append(' ').append(RUNTIME_PORT).append(' ')
             append(t.hasPressure)
-            append(" </dev/null >").append(RUNTIME_LOG).append(" 2>&1 &")
+            append(" 2>&1")
         }
-        shell(command)
+        synchronized(runtimeOutputLock) { runtimeOutput.setLength(0) }
+        val stream = manager.openStream("shell:$command")
+        runtimeStream = stream
+        runtimeDrainThread = Thread({ drainRuntime(stream) }, "touch-runtime-adb").apply {
+            isDaemon = true
+            start()
+        }
         RuntimeLaunch(probe, HELPER_REMOTE, RUNTIME_LOG)
     }
 
-    fun runtimeLog(): String = runCatching { shell("cat $RUNTIME_LOG 2>/dev/null") }.getOrDefault("")
+    fun runtimeLog(): String = synchronized(runtimeOutputLock) { runtimeOutput.toString().takeLast(4_000) }
 
     fun forgetPairing() {
+        closeRuntimeStream()
         manager.disconnectQuietly()
         runCatching { pairingMdns.stop() }
         runCatching { connectMdns.stop() }
@@ -261,9 +276,48 @@ class TouchAdbController(context: Context) : AutoCloseable {
     }
 
     override fun close() {
+        closeRuntimeStream()
         runCatching { pairingMdns.stop() }
         runCatching { connectMdns.stop() }
         manager.disconnectQuietly()
+    }
+
+    private fun drainRuntime(stream: AdbStream) {
+        val input = stream.openInputStream()
+        val buffer = ByteArray(4096)
+        try {
+            while (runtimeStream === stream) {
+                val count = try {
+                    input.read(buffer)
+                } catch (error: IOException) {
+                    if (stream.isClosed && error.message?.startsWith("Stream closed") == true) -1
+                    else throw error
+                }
+                if (count < 0) break
+                if (count > 0) {
+                    val text = String(buffer, 0, count, StandardCharsets.UTF_8)
+                    synchronized(runtimeOutputLock) {
+                        runtimeOutput.append(text)
+                        if (runtimeOutput.length > 16_000) runtimeOutput.delete(0, runtimeOutput.length - 12_000)
+                    }
+                }
+            }
+        } catch (error: Throwable) {
+            synchronized(runtimeOutputLock) {
+                runtimeOutput.append("\nADB_RUNTIME_STREAM_ERROR: ").append(error.message ?: error.javaClass.simpleName)
+            }
+        } finally {
+            if (runtimeStream === stream) runtimeStream = null
+            runCatching { stream.close() }
+        }
+    }
+
+    private fun closeRuntimeStream() {
+        val stream = runtimeStream
+        runtimeStream = null
+        runCatching { stream?.close() }
+        runtimeDrainThread?.interrupt()
+        runtimeDrainThread = null
     }
 
     private fun saveConnectEndpoint(endpoint: Endpoint) {
@@ -273,19 +327,90 @@ class TouchAdbController(context: Context) : AutoCloseable {
     private fun shell(command: String): String {
         val stream = manager.openStream("shell:$command")
         return stream.useAdb { adb ->
-            adb.openInputStream().use { input -> input.readBytes().toString(StandardCharsets.UTF_8) }
+            val input = adb.openInputStream()
+            val out = ByteArrayOutputStream()
+            val buffer = ByteArray(16 * 1024)
+            while (true) {
+                val count = try {
+                    input.read(buffer)
+                } catch (error: IOException) {
+                    // libadb-android 3.1.1 reports the remote shell's normal
+                    // CLSE as IOException("Stream closed.") instead of EOF.
+                    // Treat that specific state as end-of-stream; transport
+                    // failures with any other error still propagate.
+                    if (adb.isClosed && error.message?.startsWith("Stream closed") == true) -1
+                    else throw error
+                }
+                if (count < 0) break
+                if (count > 0) out.write(buffer, 0, count)
+            }
+            out.toByteArray().toString(StandardCharsets.UTF_8)
         }
     }
 
+    /** Push a small runtime asset using the ADB SYNC protocol.
+     *
+     * A shell `cat > file` upload is not sufficient here: closing an ADB shell
+     * stream does not guarantee the remote writer has released the inode, so an
+     * immediate exec may fail with ETXTBSY. SYNC's OKAY is the completion
+     * boundary we need.
+     */
     private fun writeRemoteFile(path: String, bytes: ByteArray) {
         require(path.startsWith("/data/local/tmp/"))
-        val stream = manager.openStream("shell:cat > ${shellQuote(path)}")
+        val stream = manager.openStream("sync:")
         stream.useAdb { adb ->
             val out = adb.openOutputStream()
-            out.write(bytes)
+            val input = adb.openInputStream()
+            val send = "$path,33188".toByteArray(StandardCharsets.UTF_8) // regular file, 0644
+            writeSyncPacket(out, "SEND", send)
+            var offset = 0
+            while (offset < bytes.size) {
+                val count = minOf(64 * 1024, bytes.size - offset)
+                writeSyncHeader(out, "DATA", count)
+                out.write(bytes, offset, count)
+                offset += count
+            }
+            writeSyncHeader(out, "DONE", (System.currentTimeMillis() / 1000L).toInt())
             out.flush()
-            // Closing the ADB stream supplies EOF to remote cat.
+
+            val status = readFully(input, 4).toString(StandardCharsets.US_ASCII)
+            when (status) {
+                "OKAY" -> Unit
+                "FAIL" -> {
+                    val length = readLeInt(input)
+                    val message = if (length in 0..65536) readFully(input, length).toString(StandardCharsets.UTF_8) else "invalid failure response"
+                    error("helper push failed: $message")
+                }
+                else -> error("helper push failed: unexpected SYNC status $status")
+            }
         }
+    }
+
+    private fun writeSyncPacket(out: java.io.OutputStream, id: String, payload: ByteArray) {
+        writeSyncHeader(out, id, payload.size)
+        out.write(payload)
+    }
+
+    private fun writeSyncHeader(out: java.io.OutputStream, id: String, value: Int) {
+        require(id.length == 4)
+        out.write(id.toByteArray(StandardCharsets.US_ASCII))
+        out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array())
+    }
+
+    private fun readLeInt(input: java.io.InputStream): Int =
+        ByteBuffer.wrap(readFully(input, 4)).order(ByteOrder.LITTLE_ENDIAN).int
+
+    private fun readFully(input: java.io.InputStream, length: Int): ByteArray {
+        val out = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val count = try { input.read(out, offset, length - offset) } catch (error: IOException) {
+                throw IOException("unexpected end of ADB SYNC response", error)
+            }
+            if (count < 0) throw IOException("unexpected end of ADB SYNC response")
+            offset += count
+        }
+        return out
     }
 
     private fun stopStaleRuntimeProcesses() {
