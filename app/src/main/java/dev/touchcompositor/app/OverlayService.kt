@@ -56,7 +56,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var runtimeStatus = "Runtime 未连接"
     private var recording = false
     private var activeRecordingName: String? = null
-    private enum class UiMode { NONE, RECORDINGS, MACROS }
+    private enum class UiMode { NONE, RECORDINGS, MACROS, CONFIGS }
     private var uiMode = UiMode.NONE
 
     private var entryView: View? = null
@@ -137,8 +137,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 syncTriggerButtons()
                 when (uiMode) {
                     UiMode.RECORDINGS -> showRecordingManager()
-                    UiMode.MACROS -> showMacroManager()
-                    UiMode.NONE -> Unit
+                    UiMode.CONFIGS -> showMacroManager()
+                    UiMode.MACROS, UiMode.NONE -> Unit
                 }
             }
         }
@@ -200,7 +200,14 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             textSize = 10f
             setTextColor(Color.argb(218, 255, 255, 255))
             background = rounded(Color.argb(112, 24, 27, 32), 8f)
-            setOnClickListener { if (menuViews.isEmpty()) showMainMenu() else hideMainMenu() }
+            setOnClickListener {
+                if (menuViews.isEmpty()) {
+                    enterMacroEditMode()
+                    showMainMenu()
+                } else {
+                    hideMainMenu()
+                }
+            }
         }
         val params = overlayParams(w, h, Gravity.TOP or Gravity.START).apply {
             x = ((resources.displayMetrics.widthPixels - w) / 2).coerceAtLeast(0)
@@ -219,21 +226,28 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         hideMainMenu()
         val size = dp(48)
         val gap = dp(12)
-        val total = size * 3 + gap * 2
+        val total = size * 4 + gap * 3
         val startX = ((resources.displayMetrics.widthPixels - total) / 2).coerceAtLeast(0)
         val y = dp(28)
         val specs = listOf(
             Triple("录制", Color.argb(184, 190, 57, 55), {
-                hideMainMenu(); uiMode = UiMode.RECORDINGS
-                hideMacroManager(); hideMacroEditor(); showRecordingManager(); syncTriggerButtons()
+                hideMainMenu()
+                exitMacroEditMode(UiMode.RECORDINGS)
+                showRecordingManager()
             }),
-            Triple("宏编辑", Color.argb(184, 52, 103, 215), {
-                hideMainMenu(); uiMode = UiMode.MACROS
-                hideRecordingManager(); showMacroManager(); syncTriggerButtons()
+            Triple("配置", Color.argb(184, 52, 103, 215), {
+                hideMainMenu()
+                exitMacroEditMode(UiMode.CONFIGS)
+                showMacroManager()
+            }),
+            Triple("+宏", Color.argb(176, 56, 137, 105), {
+                hideMainMenu()
+                if (uiMode != UiMode.MACROS) enterMacroEditMode()
+                createMacro()
             }),
             Triple("隐藏", Color.argb(170, 42, 46, 53), {
-                hideMainMenu(); hideRecordingManager(); hideMacroManager(); hideMacroEditor(); hideRecordingPicker(); hideNameEditor()
-                uiMode = UiMode.NONE; editingMacroId = null; selectedActionIndex = null; syncTriggerButtons()
+                hideMainMenu()
+                exitMacroEditMode(UiMode.NONE)
             }),
         )
         specs.forEachIndexed { index, (label, color, action) ->
@@ -249,6 +263,26 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private fun hideMainMenu() {
         menuViews.forEach { runCatching { wm.removeView(it) } }
         menuViews.clear()
+    }
+
+    private fun enterMacroEditMode() {
+        hideRecordingManager()
+        hideMacroManager()
+        hideNameEditor()
+        uiMode = UiMode.MACROS
+        editingMacroId = null
+        selectedActionIndex = null
+        syncTriggerButtons()
+    }
+
+    private fun exitMacroEditMode(nextMode: UiMode) {
+        hideMacroEditor()
+        hideRecordingPicker()
+        hideNameEditor()
+        editingMacroId = null
+        selectedActionIndex = null
+        uiMode = nextMode
+        syncTriggerButtons()
     }
 
     // Profiles / macro edit mode ---------------------------------------------
@@ -267,9 +301,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     private fun showMacroManager() {
         hideMacroManager()
-        if (recording || uiMode != UiMode.MACROS) return
+        if (recording || uiMode != UiMode.CONFIGS) return
         val root = panelRoot()
-        root.addView(panelHeader("宏编辑") { uiMode = UiMode.NONE; hideMacroManager(); syncTriggerButtons() })
+        root.addView(panelHeader("配置") { uiMode = UiMode.NONE; hideMacroManager(); syncTriggerButtons() })
 
         val profileRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         profiles.forEach { profile ->
@@ -277,7 +311,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 activeProfileId = profile.id
                 macroStore.saveActiveProfileId(profile.id)
                 editingMacroId = null; selectedActionIndex = null
-                saveProfiles(); syncTriggerButtons(); showMacroManager()
+                saveProfiles()
+                uiMode = UiMode.NONE
+                hideMacroManager()
+                syncTriggerButtons()
             }, LinearLayout.LayoutParams(-2, dp(38)).apply { rightMargin = dp(5) })
         }
         profileRow.addView(pill("+", false, true) { createProfile() }, LinearLayout.LayoutParams(dp(38), dp(38)))
@@ -296,13 +333,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         nameRow.addView(compactTextButton("删除") { deleteProfile(active) }, LinearLayout.LayoutParams(dp(58), dp(40)))
         root.addView(nameRow, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(7) })
 
-        val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        bottom.addView(compactTextButton("+ 新建宏") { createMacro() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(7) })
-        bottom.addView(TextView(this).apply {
-            text = "拖动触发器调整位置 · 双击编辑"
+        root.addView(TextView(this).apply {
+            text = "选择配置后进入普通运行态；再次展开顶部入口即可编辑触发器。"
             textSize = 10.5f; setTextColor(muted); gravity = Gravity.CENTER_VERTICAL
-        }, LinearLayout.LayoutParams(0, dp(42), 1.5f))
-        root.addView(bottom, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(6) })
+            setPadding(dp(2), dp(7), dp(2), dp(2))
+        }, LinearLayout.LayoutParams(-1, dp(42)))
 
         val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(20))
         val p = focusableOverlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply { x = dp(10); y = dp(58) }
@@ -598,11 +633,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun hideMacroEditor() { editorView?.let { runCatching { wm.removeView(it) } }; editorView = null }
-    private fun closeMacroEditor() { hideMacroEditor(); hideRecordingPicker(); editingMacroId = null; selectedActionIndex = null; syncTriggerButtons(); if (uiMode == UiMode.MACROS) showMacroManager() }
+    private fun closeMacroEditor() { hideMacroEditor(); hideRecordingPicker(); editingMacroId = null; selectedActionIndex = null; syncTriggerButtons() }
     private fun resizeTrigger(macro: TouchMacro, delta: Float) { macro.trigger.sizeDp = (macro.trigger.sizeDp + delta).coerceIn(28f, 96f); saveProfiles(); syncTriggerButtons(); showMacroEditor(macro) }
     private fun deleteMacro(macro: TouchMacro) {
         if (runningMacroId == macro.id) macroRunner.stop(); activeProfile().macros.removeAll { it.id == macro.id }; saveProfiles()
-        editingMacroId = null; selectedActionIndex = null; hideMacroEditor(); hideRecordingPicker(); syncTriggerButtons(); if (uiMode == UiMode.MACROS) showMacroManager()
+        editingMacroId = null; selectedActionIndex = null; hideMacroEditor(); hideRecordingPicker(); syncTriggerButtons()
     }
     private fun moveAction(macro: TouchMacro, index: Int, delta: Int) {
         if (macro.actions.isEmpty()) return; val to = (index + delta).coerceIn(0, macro.actions.lastIndex); if (to == index) return
