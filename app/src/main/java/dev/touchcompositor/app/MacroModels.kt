@@ -44,10 +44,10 @@ data class TouchMacro(
     val actions: MutableList<MacroAction> = mutableListOf(),
 )
 
-/** v3 intentionally starts a fresh macro model; old editor data is left untouched. */
+/** v4 uses global logical-screen coordinates for visual position editing. */
 class MacroStore(context: Context) {
     private val prefs = context.getSharedPreferences("touch_macros", Context.MODE_PRIVATE)
-    private val key = "macros_v3"
+    private val key = "macros_v4"
 
     fun load(): MutableList<TouchMacro> {
         val raw = prefs.getString(key, null) ?: return mutableListOf()

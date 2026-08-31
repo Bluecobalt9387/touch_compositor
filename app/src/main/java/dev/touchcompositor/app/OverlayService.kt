@@ -148,10 +148,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         }
     }
 
-    override fun onMacroStarted(name: String) = Unit
+    override fun onMacroStarted(name: String) {
+        main.post {
+            triggerViews.values.forEach { it.alpha = 0.72f }
+        }
+    }
 
     override fun onMacroFinished(name: String, stopped: Boolean, error: String?) {
         main.post {
+            triggerViews.values.forEach { it.alpha = 1f }
             if (error != null) runtimeStatus = "宏错误 · $error"
             refreshPanelIfShown()
         }
@@ -230,6 +235,23 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         installTriggerTouch(view, params, macro, size)
         wm.addView(view, params)
         triggerViews[macro.id] = view
+        // WindowManager x/y are relative to the overlay parent frame, which may
+        // start below system bars. Correct the actual on-screen center after layout.
+        view.post {
+            val loc = IntArray(2)
+            view.getLocationOnScreen(loc)
+            val desiredX = macro.trigger.x * w
+            val desiredY = macro.trigger.y * h
+            val actualX = loc[0] + view.width / 2f
+            val actualY = loc[1] + view.height / 2f
+            val dx = (desiredX - actualX).toInt()
+            val dy = (desiredY - actualY).toInt()
+            if (dx != 0 || dy != 0) {
+                params.x += dx
+                params.y += dy
+                runCatching { wm.updateViewLayout(view, params) }
+            }
+        }
     }
 
     private fun installTriggerTouch(view: View, params: WindowManager.LayoutParams, macro: TouchMacro, size: Int) {
@@ -241,7 +263,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         var holdStarted = false
         val holdRunnable = Runnable {
             if (!moved && macro.trigger.mode == MacroTriggerMode.HOLD_REPEAT && !macroRunner.isRunning) {
-                holdStarted = runCatching { macroRunner.start(macro, repeat = true); true }.getOrDefault(false)
+                runCatching { macroRunner.start(macro, repeat = true) }
+                    .onSuccess { holdStarted = true; view.alpha = 0.72f }
+                    .onFailure { t ->
+                        holdStarted = false
+                        runtimeStatus = "宏错误 · ${t.message ?: t.javaClass.simpleName}"
+                        view.alpha = 1f
+                    }
             }
         }
         view.setOnTouchListener { _, e ->
@@ -272,11 +300,24 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                     if (moved && !holdStarted) {
                         val w = resources.displayMetrics.widthPixels.toFloat()
                         val h = resources.displayMetrics.heightPixels.toFloat()
-                        macro.trigger.x = ((params.x + size / 2f) / w).coerceIn(0f, 1f)
-                        macro.trigger.y = ((params.y + size / 2f) / h).coerceIn(0f, 1f)
+                        val loc = IntArray(2)
+                        view.getLocationOnScreen(loc)
+                        macro.trigger.x = ((loc[0] + view.width / 2f) / w).coerceIn(0f, 1f)
+                        macro.trigger.y = ((loc[1] + view.height / 2f) / h).coerceIn(0f, 1f)
                         macroStore.save(macros)
                     } else if (macro.trigger.mode == MacroTriggerMode.CLICK_ONCE && e.actionMasked == MotionEvent.ACTION_UP) {
-                        if (!macroRunner.isRunning) runCatching { macroRunner.start(macro, repeat = false) }
+                        if (!macroRunner.isRunning) {
+                            runCatching { macroRunner.start(macro, repeat = false) }
+                                .onSuccess {
+                                    view.animate().alpha(0.72f).setDuration(70).withEndAction {
+                                        if (!macroRunner.isRunning) view.animate().alpha(1f).setDuration(100).start()
+                                    }.start()
+                                }
+                                .onFailure { t ->
+                                    runtimeStatus = "宏错误 · ${t.message ?: t.javaClass.simpleName}"
+                                    view.alpha = 1f
+                                }
+                        }
                     } else if (holdStarted) {
                         macroRunner.stop()
                     }
@@ -590,15 +631,20 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         onConfirm: (Pair<Float, Float>, Pair<Float, Float>?) -> Unit,
     ) {
         removePanel(); hideBall(); hideTriggerButtons(); removePositionEditor()
-        val w = resources.displayMetrics.widthPixels
-        val h = resources.displayMetrics.heightPixels
-        var sx = start.first.coerceIn(0f, 1f); var sy = start.second.coerceIn(0f, 1f)
-        var ex = end?.first?.coerceIn(0f, 1f) ?: sx; var ey = end?.second?.coerceIn(0f, 1f) ?: sy
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
+
+        // The overlay's (0,0) is not guaranteed to be the logical display's
+        // (0,0): on this vivo it normally starts below a ~120 px system inset.
+        // Keep macro coordinates in global logical-display space and convert to
+        // local overlay coordinates only for rendering the handles.
+        var globalStartX = start.first.coerceIn(0f, 1f) * screenW
+        var globalStartY = start.second.coerceIn(0f, 1f) * screenH
+        var globalEndX = (end?.first ?: start.first).coerceIn(0f, 1f) * screenW
+        var globalEndY = (end?.second ?: start.second).coerceIn(0f, 1f) * screenH
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.argb(18, 0, 0, 0)) }
-        val guide = MacroGeometryGuideView(this).apply {
-            arrowEnabled = end != null
-        }
+        val guide = MacroGeometryGuideView(this).apply { arrowEnabled = end != null }
         root.addView(guide, FrameLayout.LayoutParams(-1, -1))
 
         val handleSize = dp(48)
@@ -612,27 +658,52 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         root.addView(startHandle, FrameLayout.LayoutParams(handleSize, handleSize))
         if (endHandle != null) root.addView(endHandle, FrameLayout.LayoutParams(handleSize, handleSize))
 
+        fun rootOrigin(): Pair<Int, Int> {
+            val loc = IntArray(2)
+            root.getLocationOnScreen(loc)
+            return loc[0] to loc[1]
+        }
+
         fun update() {
-            val spx = sx * w; val spy = sy * h; val epx = ex * w; val epy = ey * h
-            guide.x1 = spx; guide.y1 = spy; guide.x2 = epx; guide.y2 = epy
+            val (ox, oy) = rootOrigin()
+            val localStartX = globalStartX - ox
+            val localStartY = globalStartY - oy
+            val localEndX = globalEndX - ox
+            val localEndY = globalEndY - oy
+
+            guide.x1 = localStartX; guide.y1 = localStartY
+            guide.x2 = localEndX; guide.y2 = localEndY
+
             (startHandle.layoutParams as FrameLayout.LayoutParams).also {
-                it.leftMargin = (spx - handleSize / 2f).toInt().coerceIn(0, w - handleSize)
-                it.topMargin = (spy - handleSize / 2f).toInt().coerceIn(0, h - handleSize)
+                it.leftMargin = (localStartX - handleSize / 2f).toInt().coerceIn(0, (root.width - handleSize).coerceAtLeast(0))
+                it.topMargin = (localStartY - handleSize / 2f).toInt().coerceIn(0, (root.height - handleSize).coerceAtLeast(0))
                 startHandle.layoutParams = it
             }
             if (endHandle != null) (endHandle.layoutParams as FrameLayout.LayoutParams).also {
-                it.leftMargin = (epx - handleSize / 2f).toInt().coerceIn(0, w - handleSize)
-                it.topMargin = (epy - handleSize / 2f).toInt().coerceIn(0, h - handleSize)
+                it.leftMargin = (localEndX - handleSize / 2f).toInt().coerceIn(0, (root.width - handleSize).coerceAtLeast(0))
+                it.topMargin = (localEndY - handleSize / 2f).toInt().coerceIn(0, (root.height - handleSize).coerceAtLeast(0))
                 endHandle.layoutParams = it
             }
         }
+
         fun drag(handle: View, isStart: Boolean) {
+            var downRawX = 0f
+            var downRawY = 0f
+            var startGlobalX = 0f
+            var startGlobalY = 0f
             handle.setOnTouchListener { _, e ->
                 when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                        val nx = (e.rawX / w).coerceIn(0f, 1f)
-                        val ny = (e.rawY / h).coerceIn(0f, 1f)
-                        if (isStart) { sx = nx; sy = ny } else { ex = nx; ey = ny }
+                    MotionEvent.ACTION_DOWN -> {
+                        downRawX = e.rawX; downRawY = e.rawY
+                        startGlobalX = if (isStart) globalStartX else globalEndX
+                        startGlobalY = if (isStart) globalStartY else globalEndY
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val gx = (startGlobalX + e.rawX - downRawX).coerceIn(0f, screenW.toFloat())
+                        val gy = (startGlobalY + e.rawY - downRawY).coerceIn(0f, screenH.toFloat())
+                        if (isStart) { globalStartX = gx; globalStartY = gy }
+                        else { globalEndX = gx; globalEndY = gy }
                         update(); true
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
@@ -659,7 +730,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         banner.addView(TextView(this).apply {
             text = "确定"; textSize = 11f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
             setPadding(dp(10), 0, dp(10), 0); setOnClickListener {
-                val a = sx to sy; val b = if (end != null) ex to ey else null
+                val a = (globalStartX / screenW).coerceIn(0f, 1f) to (globalStartY / screenH).coerceIn(0f, 1f)
+                val b = if (end != null) {
+                    (globalEndX / screenW).coerceIn(0f, 1f) to (globalEndY / screenH).coerceIn(0f, 1f)
+                } else null
                 closePositionEditor(true) { onConfirm(a, b) }
             }
         }, LinearLayout.LayoutParams(-2, -1))
