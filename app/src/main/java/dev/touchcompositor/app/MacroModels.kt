@@ -227,15 +227,19 @@ class MacroRunner(
     fun stop() {
         stopRequested.set(true)
         ensureControlClient()
-        runCatching { controlClient.request("STOP_PLAYBACK", 1000) }
-        runCatching { controlClient.request("RELEASE_ALL", 1000) }
+        runCatching { controlClient.request("STOP_MACRO_PLAYBACK", 1000) }
+        runCatching { controlClient.request("MACRO_RELEASE_ALL", 1000) }
+        runCatching { controlClient.request("MACRO_END", 1000) }
     }
 
     private fun runMacro(macro: TouchMacro, repeat: Boolean) {
         var error: String? = null
         listener?.onMacroStarted(macro.name)
+        var macroSessionStarted = false
         try {
             ensureExecClient()
+            execClient.request("MACRO_BEGIN", 4000)
+            macroSessionStarted = true
             do {
                 for (action in macro.actions.toList()) {
                     if (stopRequested.get()) break
@@ -246,10 +250,11 @@ class MacroRunner(
         } catch (t: Throwable) {
             if (!stopRequested.get()) error = t.message ?: t.javaClass.simpleName
         } finally {
-            if (stopRequested.get() || error != null) {
+            if (macroSessionStarted) {
                 ensureControlClient()
-                runCatching { controlClient.request("STOP_PLAYBACK", 1000) }
-                runCatching { controlClient.request("RELEASE_ALL", 1000) }
+                runCatching { controlClient.request("STOP_MACRO_PLAYBACK", 1000) }
+                runCatching { controlClient.request("MACRO_RELEASE_ALL", 1000) }
+                runCatching { controlClient.request("MACRO_END", 1000) }
             }
             listener?.onMacroFinished(macro.name, stopRequested.get(), error)
         }
@@ -260,15 +265,15 @@ class MacroRunner(
             is MacroAction.Tap -> {
                 val (x, y) = px(action.x, action.y)
                 val pointerId = 10_001
-                execClient.request("DOWN $pointerId $x $y")
+                execClient.request("MACRO_DOWN $pointerId $x $y")
                 sleepInterruptibly(action.holdMs)
-                if (!stopRequested.get()) execClient.request("UP $pointerId $x $y")
+                if (!stopRequested.get()) execClient.request("MACRO_UP $pointerId $x $y")
             }
             is MacroAction.Drag -> {
                 val (x1, y1) = px(action.x1, action.y1)
                 val (x2, y2) = px(action.x2, action.y2)
                 val pointerId = 10_001
-                execClient.request("DOWN $pointerId $x1 $y1")
+                execClient.request("MACRO_DOWN $pointerId $x1 $y1")
                 val frames = ceil(action.durationMs / 16.0).toInt().coerceAtLeast(1)
                 val started = SystemClock.uptimeMillis()
                 for (i in 1..frames) {
@@ -276,17 +281,17 @@ class MacroRunner(
                     val t = i.toFloat() / frames.toFloat()
                     val x = x1 + (x2 - x1) * t
                     val y = y1 + (y2 - y1) * t
-                    execClient.request("MOVE $pointerId $x $y")
+                    execClient.request("MACRO_MOVE $pointerId $x $y")
                     val due = started + action.durationMs * i / frames
                     val remain = due - SystemClock.uptimeMillis()
                     if (remain > 0) sleepInterruptibly(remain)
                 }
-                if (!stopRequested.get()) execClient.request("UP $pointerId $x2 $y2")
+                if (!stopRequested.get()) execClient.request("MACRO_UP $pointerId $x2 $y2")
             }
             is MacroAction.Wait -> sleepInterruptibly(action.durationMs)
             is MacroAction.Recording -> {
                 val speed = action.speed.coerceIn(0.1f, 8f)
-                execClient.request("PLAY_SYNC ${action.recordingName} $speed 1", 3_600_000)
+                execClient.request("PLAY_MACRO_SYNC ${action.recordingName} $speed 1", 3_600_000)
             }
         }
     }

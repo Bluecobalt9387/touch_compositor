@@ -35,6 +35,8 @@ class TouchRuntimeServer(
     @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
     private var displayWatcher: DisplayStateWatcher? = null
+    private val macroLock = Any()
+    @Volatile private var macroSession: IsolatedMacroTouchSession? = null
 
     fun runStdio() {
         engine.start()
@@ -125,9 +127,38 @@ class TouchRuntimeServer(
                 }
                 ok(out, "${a[0].uppercase()} id=$id")
             }
-            "RELEASE_ALL" -> {
-                engine.cancelAll()
-                ok(out, "RELEASED")
+            "MACRO_BEGIN" -> {
+                require(a.size == 1) { "MACRO_BEGIN" }
+                synchronized(macroLock) {
+                    macroSession?.close()
+                    macroSession = IsolatedMacroTouchSession()
+                }
+                ok(out, "MACRO_STARTED")
+            }
+            "MACRO_DOWN", "MACRO_MOVE", "MACRO_UP" -> {
+                require(a.size in 4..10) { "${a[0]} <id> <x> <y> [pressure size touchMajor touchMinor toolMajor toolMinor]" }
+                val session = macroSession ?: error("macro session is not active")
+                val id = a[1].toInt()
+                val x = a[2].toFloat()
+                val y = a[3].toFloat()
+                val attrs = parseAttributes(a.drop(4))
+                when (a[0].uppercase()) {
+                    "MACRO_DOWN" -> session.down(id, x, y, attrs)
+                    "MACRO_MOVE" -> session.move(id, x, y, attrs)
+                    "MACRO_UP" -> session.up(id, x, y, attrs)
+                }
+                ok(out, "${a[0].uppercase()} id=$id")
+            }
+            "MACRO_RELEASE_ALL" -> {
+                macroSession?.cancelPointers()
+                ok(out, "MACRO_RELEASED")
+            }
+            "MACRO_END" -> {
+                synchronized(macroLock) {
+                    macroSession?.close()
+                    macroSession = null
+                }
+                ok(out, "MACRO_ENDED")
             }
             "RECORD_EXCLUDE_CLEAR" -> {
                 engine.setRecordingExclusions(emptyList())
@@ -233,6 +264,29 @@ class TouchRuntimeServer(
                     playbackBusy.set(false)
                 }
             }
+            "PLAY_MACRO_SYNC" -> {
+                require(a.size in 2..4) { "PLAY_MACRO_SYNC <name> [speed] [repeat]" }
+                check(playbackBusy.compareAndSet(false, true)) { "playback already active" }
+                val session = macroSession ?: error("macro target is not active")
+                val name = sanitizeName(a[1])
+                val speed = (a.getOrNull(2)?.toDouble() ?: 1.0).also { require(it in 0.1..8.0) }
+                val repeat = (a.getOrNull(3)?.toInt() ?: 1).also { require(it in 1..10_000) }
+                try {
+                    val recording = FileInputStream(recordingFile(name)).use { TouchRecordingCodec.read(it) }
+                    val result = session.play(
+                        recording,
+                        PlaybackTarget(currentDisplayWidth, currentDisplayHeight, currentRotation),
+                        PlaybackOptions(speed = speed, repeatCount = repeat),
+                    )
+                    ok(out, "MACRO_PLAYBACK_DONE name=$name repeats=${result.completedRepeats} stopped=${result.stopped} frames=${result.emittedFrames}")
+                } finally {
+                    playbackBusy.set(false)
+                }
+            }
+            "STOP_MACRO_PLAYBACK" -> {
+                macroSession?.stopPlayback()
+                ok(out, "STOPPING_MACRO_PLAYBACK")
+            }
             "PAUSE" -> { engine.pausePlayback(); ok(out, "PAUSED") }
             "RESUME" -> { engine.resumePlayback(); ok(out, "RESUMED") }
             "STOP_PLAYBACK" -> { engine.stopPlayback(); ok(out, "STOPPING_PLAYBACK") }
@@ -268,6 +322,10 @@ class TouchRuntimeServer(
         displayWatcher?.close()
         displayWatcher = null
         engine.stopPlayback()
+        synchronized(macroLock) {
+            macroSession?.close()
+            macroSession = null
+        }
         runCatching { playbackThread?.join(1000) }
         engine.close()
         out.println("BYE")

@@ -76,6 +76,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var editingMacroId: String? = null
     private var selectedActionIndex: Int? = null
     private var runningMacroId: String? = null
+    private var macroInputPassthrough = false
 
     private val ink = Color.rgb(28, 31, 36)
     private val muted = Color.rgb(110, 116, 126)
@@ -198,6 +199,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     override fun onMacroFinished(name: String, stopped: Boolean, error: String?) {
         main.post {
+            setMacroInputPassthrough(false)
             runningMacroId = null
             if (error != null) runtimeStatus = "宏错误 · $error"
             syncTriggerButtons()
@@ -507,9 +509,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun startMacro(macro: TouchMacro, repeat: Boolean, source: View?): Boolean = runCatching {
-        macroRunner.start(macro, repeat); runningMacroId = macro.id
-        source?.background = triggerBackground(uiMode == UiMode.MACROS && editingMacroId == macro.id, true); true
+        setMacroInputPassthrough(true)
+        macroRunner.start(macro, repeat)
+        runningMacroId = macro.id
+        source?.background = triggerBackground(uiMode == UiMode.MACROS && editingMacroId == macro.id, true)
+        true
     }.getOrElse {
+        setMacroInputPassthrough(false)
         source?.background = rounded(Color.argb(205, 204, 66, 63), macro.trigger.sizeDp / 2f)
         source?.postDelayed({ source.background = triggerBackground(false, false) }, 550)
         runtimeStatus = "宏错误 · ${it.message ?: it.javaClass.simpleName}"; false
@@ -932,6 +938,36 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         }
     }
 
+    private fun setMacroInputPassthrough(enabled: Boolean) {
+        if (macroInputPassthrough == enabled) return
+        macroInputPassthrough = enabled
+        currentOverlayWindows().forEach { view ->
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@forEach
+            val newFlags = if (enabled) {
+                params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            }
+            if (newFlags != params.flags) {
+                params.flags = newFlags
+                runCatching { wm.updateViewLayout(view, params) }
+            }
+        }
+    }
+
+    private fun currentOverlayWindows(): List<View> = buildList {
+        entryView?.let(::add)
+        addAll(menuViews)
+        recordingManagerView?.let(::add)
+        macroManagerView?.let(::add)
+        editorView?.let(::add)
+        recordingPickerView?.let(::add)
+        nameEditorView?.let(::add)
+        recordingStopView?.let(::add)
+        positionEditorView?.let(::add)
+        addAll(triggerViews.values)
+    }.distinct()
+
     private fun removeAllWindows() {
         hideMainMenu(); hideRecordingManager(); hideMacroManager(); hideMacroEditor(); hideRecordingPicker(); hideNameEditor(); hideTriggerButtons()
         removeRecordingStop(); removePositionEditor(); hideEntry()
@@ -1008,7 +1044,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     private fun focusableOverlayParams(width: Int, height: Int, gravity: Int) = WindowManager.LayoutParams(
         width, height, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+        (WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) or
+            (if (macroInputPassthrough) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
         PixelFormat.TRANSLUCENT,
     ).apply { this.gravity = gravity; softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE }
 
@@ -1072,7 +1109,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         width,
         height,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) or
+            (if (macroInputPassthrough) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
         PixelFormat.TRANSLUCENT,
     ).apply { this.gravity = gravity }
 
