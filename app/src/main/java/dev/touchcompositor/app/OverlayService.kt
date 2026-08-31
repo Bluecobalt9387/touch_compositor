@@ -28,13 +28,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 /**
- * Minimal overlay shell:
- * - tiny top handle -> three translucent bubbles: record / macros / hide
- * - profiles select which trigger set is visible
- * - macros are edited by double tapping their own trigger
+ * Compact product overlay:
+ * - tiny top entry opens macro-edit mode and compact mode controls
+ * - recording/configuration use readable transient management windows
+ * - macro triggers remain unobtrusive in normal use and become editable only in edit mode
  */
 class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     companion object {
@@ -54,6 +55,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var profiles = mutableListOf<MacroProfile>()
     private var activeProfileId: String? = null
     private var runtimeStatus = "Runtime 未连接"
+    private val runtimeRecoveryInFlight = AtomicBoolean(false)
+    @Volatile private var serviceDestroying = false
     private var recording = false
     private var activeRecordingName: String? = null
     private enum class UiMode { NONE, RECORDINGS, MACROS, CONFIGS }
@@ -111,6 +114,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceDestroying = true
         macroRunner.close()
         removeAllWindows()
         client.close()
@@ -162,7 +166,30 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     override fun onDisconnected(message: String) {
-        main.post { runtimeStatus = "Runtime 已断开" }
+        if (serviceDestroying) return
+        main.post { runtimeStatus = "Runtime 已断开 · 正在恢复" }
+        recoverRuntime()
+    }
+
+    private fun recoverRuntime() {
+        if (serviceDestroying || !runtimeRecoveryInFlight.compareAndSet(false, true)) return
+        io.execute {
+            val environment = RuntimeEnvironment(this)
+            val result = try {
+                environment.ensureReady()
+            } finally {
+                environment.close()
+            }
+            runtimeRecoveryInFlight.set(false)
+            if (serviceDestroying) return@execute
+            result.onSuccess {
+                runCatching { client.connect() }
+                    .onSuccess { requestStatus() }
+                    .onFailure { t -> main.post { runtimeStatus = "Runtime 恢复失败 · ${t.message ?: "重连失败"}" } }
+            }.onFailure { t ->
+                main.post { runtimeStatus = "Runtime 恢复失败 · ${t.message ?: "请重新打开主界面"}" }
+            }
+        }
     }
 
     override fun onEvent(line: String) = Unit

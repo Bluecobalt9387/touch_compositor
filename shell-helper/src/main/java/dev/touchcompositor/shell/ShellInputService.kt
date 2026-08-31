@@ -74,11 +74,12 @@ object ShellInputService {
             }
             "runtime-tcp" -> {
                 val a = args.drop(1)
-                require(a.size >= 6) { "runtime-tcp <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port]" }
+                require(a.size >= 6) { "runtime-tcp <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port] [hasPressure]" }
                 LiveTouchEngine(
                     devicePath = a[0], rawMaxX = a[1].toInt(), rawMaxY = a[2].toInt(),
                     baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(), initialRotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
                     grabHelperPath = a[5],
+                    hasHardwarePressure = a.getOrNull(8)?.toBooleanStrictOrNull() ?: false,
                 ).let { engine ->
                     TouchRuntimeServer(
                         engine = engine, baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(),

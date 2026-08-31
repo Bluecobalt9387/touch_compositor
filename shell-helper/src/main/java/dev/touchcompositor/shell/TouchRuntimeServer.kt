@@ -261,7 +261,7 @@ class TouchRuntimeServer(
         }.also { it.start() }
     }
 
-    private fun ready(out: PrintWriter) = out.println("READY touch-runtime-v1 ${engine.status()}")
+    private fun ready(out: PrintWriter) = out.println("READY touch-runtime-v1 build=${RuntimeBuild.BUILD} ${engine.status()}")
 
     private fun closeEngine(out: PrintWriter) {
         if (!shuttingDown.compareAndSet(false, true) && !shuttingDown.get()) return
