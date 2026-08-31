@@ -12,9 +12,11 @@ enum class MacroTriggerMode { CLICK_ONCE, HOLD_REPEAT }
 
 data class MacroTrigger(
     var mode: MacroTriggerMode = MacroTriggerMode.CLICK_ONCE,
-    /** Normalized trigger-button center. */
+    /** Normalized trigger-button center in the logical display. */
     var x: Float = 0.86f,
     var y: Float = 0.45f,
+    /** Visual trigger diameter. */
+    var sizeDp: Float = 46f,
 )
 
 sealed class MacroAction {
@@ -44,23 +46,65 @@ data class TouchMacro(
     val actions: MutableList<MacroAction> = mutableListOf(),
 )
 
-/** v4 uses global logical-screen coordinates for visual position editing. */
+data class MacroProfile(
+    val id: String = UUID.randomUUID().toString(),
+    var name: String,
+    val macros: MutableList<TouchMacro> = mutableListOf(),
+)
+
+/** Profile-aware macro persistence. Existing v4 macros migrate once into 配置 1. */
 class MacroStore(context: Context) {
     private val prefs = context.getSharedPreferences("touch_macros", Context.MODE_PRIVATE)
-    private val key = "macros_v4"
+    private val profilesKey = "macro_profiles_v1"
+    private val activeProfileKey = "active_macro_profile_v1"
+    private val legacyKey = "macros_v4"
 
-    fun load(): MutableList<TouchMacro> {
-        val raw = prefs.getString(key, null) ?: return mutableListOf()
-        return runCatching {
-            val array = JSONArray(raw)
+    fun loadProfiles(): MutableList<MacroProfile> {
+        val stored = prefs.getString(profilesKey, null)
+        if (stored != null) {
+            return runCatching {
+                val array = JSONArray(stored)
+                MutableList(array.length()) { i -> decodeProfile(array.getJSONObject(i)) }
+            }.getOrElse { mutableListOf() }
+        }
+
+        val legacy = prefs.getString(legacyKey, null)
+        val macros = if (legacy == null) mutableListOf() else runCatching {
+            val array = JSONArray(legacy)
             MutableList(array.length()) { i -> decodeMacro(array.getJSONObject(i)) }
         }.getOrElse { mutableListOf() }
+        val profiles = mutableListOf(MacroProfile(name = "配置 1", macros = macros))
+        saveProfiles(profiles)
+        saveActiveProfileId(profiles.first().id)
+        return profiles
     }
 
-    fun save(macros: List<TouchMacro>) {
+    fun saveProfiles(profiles: List<MacroProfile>) {
         val array = JSONArray()
-        macros.forEach { array.put(encodeMacro(it)) }
-        prefs.edit().putString(key, array.toString()).apply()
+        profiles.forEach { profile ->
+            array.put(JSONObject().apply {
+                put("id", profile.id)
+                put("name", profile.name)
+                put("macros", JSONArray().apply { profile.macros.forEach { put(encodeMacro(it)) } })
+            })
+        }
+        prefs.edit().putString(profilesKey, array.toString()).apply()
+    }
+
+    fun activeProfileId(): String? = prefs.getString(activeProfileKey, null)
+
+    fun saveActiveProfileId(id: String) {
+        prefs.edit().putString(activeProfileKey, id).apply()
+    }
+
+    private fun decodeProfile(obj: JSONObject): MacroProfile {
+        val macrosArray = obj.optJSONArray("macros") ?: JSONArray()
+        val macros = MutableList(macrosArray.length()) { i -> decodeMacro(macrosArray.getJSONObject(i)) }
+        return MacroProfile(
+            id = obj.optString("id", UUID.randomUUID().toString()),
+            name = obj.optString("name", "配置"),
+            macros = macros,
+        )
     }
 
     private fun encodeMacro(macro: TouchMacro): JSONObject = JSONObject().apply {
@@ -70,6 +114,7 @@ class MacroStore(context: Context) {
             put("mode", macro.trigger.mode.name)
             put("x", macro.trigger.x.toDouble())
             put("y", macro.trigger.y.toDouble())
+            put("sizeDp", macro.trigger.sizeDp.toDouble())
         })
         put("actions", JSONArray().apply {
             macro.actions.forEach { action ->
@@ -111,6 +156,7 @@ class MacroStore(context: Context) {
                 .getOrDefault(MacroTriggerMode.CLICK_ONCE),
             x = triggerObj.optDouble("x", 0.86).toFloat().coerceIn(0f, 1f),
             y = triggerObj.optDouble("y", 0.45).toFloat().coerceIn(0f, 1f),
+            sizeDp = triggerObj.optDouble("sizeDp", 46.0).toFloat().coerceIn(28f, 96f),
         )
         val actions = mutableListOf<MacroAction>()
         val array = obj.optJSONArray("actions") ?: JSONArray()
