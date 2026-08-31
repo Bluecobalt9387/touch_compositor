@@ -43,6 +43,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         const val ACTION_HIDE = "dev.touchcompositor.app.HIDE_OVERLAY"
         private const val HOLD_TRIGGER_DELAY_MS = 360L
         private const val DOUBLE_TAP_MS = 240L
+        private const val PASSTHROUGH_WINDOW_ALPHA = 0.75f
     }
 
     private val io = Executors.newSingleThreadExecutor()
@@ -166,6 +167,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         main.post {
             runtimeStatus = ready.removePrefix("READY touch-runtime-v1 ")
             syncDisplayConfig()
+            // Runtime state is ephemeral. A reconnect/restart loses raw trigger regions,
+            // so always restore them from the current UI/profile state.
+            syncRuntimeTriggerRegions()
         }
     }
 
@@ -360,6 +364,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         syncTriggerButtons()
     }
 
+    /** Enter normal runtime mode from any transient management surface. */
+    private fun enterRuntimeMode() {
+        cancelRawTriggerHolds()
+        editingMacroId = null
+        selectedActionIndex = null
+        uiMode = UiMode.NONE
+        syncTriggerButtons()
+    }
+
     // Profiles / macro edit mode ---------------------------------------------
 
     private fun activeProfile(): MacroProfile {
@@ -378,7 +391,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         hideMacroManager()
         if (recording || uiMode != UiMode.CONFIGS) return
         val root = panelRoot()
-        root.addView(panelHeader("配置") { uiMode = UiMode.NONE; hideMacroManager(); syncTriggerButtons() })
+        root.addView(panelHeader("配置") { hideMacroManager(); enterRuntimeMode() })
 
         val profileRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         profiles.forEach { profile ->
@@ -387,9 +400,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 macroStore.saveActiveProfileId(profile.id)
                 editingMacroId = null; selectedActionIndex = null
                 saveProfiles()
-                uiMode = UiMode.NONE
                 hideMacroManager()
-                syncTriggerButtons()
+                enterRuntimeMode()
             }, LinearLayout.LayoutParams(-2, dp(38)).apply { rightMargin = dp(5) })
         }
         profileRow.addView(pill("+", false, true) { createProfile() }, LinearLayout.LayoutParams(dp(38), dp(38)))
@@ -485,7 +497,14 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val params = overlayParams(size, size, Gravity.TOP or Gravity.START).apply {
             x = (macro.trigger.x * w - size / 2f).toInt().coerceIn(0, (w - size).coerceAtLeast(0))
             y = (macro.trigger.y * h - size / 2f).toInt().coerceIn(0, (h - size).coerceAtLeast(0))
-            if (uiMode != UiMode.MACROS) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            if (uiMode != UiMode.MACROS) {
+                flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                // Android 12+ may reject touches through a non-touchable application
+                // overlay when the overlay window itself is fully opaque. Background
+                // drawable alpha is not enough; the Window alpha must also be below
+                // the obscuring-touch threshold.
+                alpha = PASSTHROUGH_WINDOW_ALPHA
+            }
         }
         if (uiMode == UiMode.MACROS) installTriggerTouch(view, params, macro, size)
         wm.addView(view, params); triggerViews[macro.id] = view
@@ -574,7 +593,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         hideRecordingManager()
         if (recording || uiMode != UiMode.RECORDINGS) return
         val root = panelRoot()
-        root.addView(panelHeader("录制动作") { uiMode = UiMode.NONE; hideRecordingManager() })
+        root.addView(panelHeader("录制动作") { hideRecordingManager(); enterRuntimeMode() })
 
         val create = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val labelInput = compactInput("", "新录制名称")
@@ -1018,6 +1037,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         } else {
             params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
         }
+        params.alpha = if (enabled) PASSTHROUGH_WINDOW_ALPHA else 1f
         runCatching { wm.updateViewLayout(view, params) }
     }
 
