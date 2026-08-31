@@ -30,6 +30,7 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Compact product overlay:
@@ -52,6 +53,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private lateinit var macroStore: MacroStore
     private lateinit var macroRunner: MacroRunner
     private lateinit var wm: WindowManager
+    private lateinit var screenGeometry: LogicalScreenGeometry
 
     private var profiles = mutableListOf<MacroProfile>()
     private var activeProfileId: String? = null
@@ -77,6 +79,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var editingMacroId: String? = null
     private var selectedActionIndex: Int? = null
     private var runningMacroId: String? = null
+    private var triggerGeometryGeneration = 0L
+    @Volatile private var triggerRegionRevision = 0L
     private val rawTriggerHoldRunnables = mutableMapOf<String, Runnable>()
     private val rawTriggerHoldStarted = mutableSetOf<String>()
     private var entryPassthroughForMacro = false
@@ -91,14 +95,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        screenGeometry = LogicalScreenGeometry {
+            resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
+        }
         macroStore = MacroStore(this)
         profiles = macroStore.loadProfiles()
         ensureProfile()
         activeProfileId = macroStore.activeProfileId()?.takeIf { id -> profiles.any { it.id == id } }
             ?: profiles.first().id.also { macroStore.saveActiveProfileId(it) }
-        macroRunner = MacroRunner {
-            resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
-        }.also { it.listener = this }
+        macroRunner = MacroRunner { screenGeometry.size() }.also { it.listener = this }
         client.listener = this
         connectRuntime()
     }
@@ -470,11 +475,16 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     // Trigger buttons ----------------------------------------------------------
 
     private fun syncTriggerButtons() {
+        val generation = ++triggerGeometryGeneration
         hideTriggerButtons()
         if (Settings.canDrawOverlays(this) && !recording && positionEditorView == null) {
-            activeProfile().macros.forEachIndexed { index, macro -> showMacroTrigger(macro, index) }
+            activeProfile().macros.forEachIndexed { index, macro ->
+                showMacroTrigger(macro, index, generation)
+            }
         }
-        syncRuntimeTriggerRegions()
+        // Edit/recording modes must disable raw hit regions immediately. Runtime
+        // mode waits until every trigger has a measured global window bound.
+        syncRuntimeTriggerRegions(generation)
     }
 
     private fun hideTriggerButtons() {
@@ -482,10 +492,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         triggerViews.clear()
     }
 
-    private fun showMacroTrigger(macro: TouchMacro, index: Int) {
+    private fun showMacroTrigger(macro: TouchMacro, index: Int, generation: Long) {
         val size = dp(macro.trigger.sizeDp).coerceAtLeast(dp(28))
-        val w = resources.displayMetrics.widthPixels
-        val h = resources.displayMetrics.heightPixels
+        val (screenW, screenH) = screenGeometry.size()
+        val desiredCenter = screenGeometry.toGlobal(macro.trigger.x, macro.trigger.y)
         val editing = uiMode == UiMode.MACROS && editingMacroId == macro.id
         val running = runningMacroId == macro.id
         val view = TextView(this).apply {
@@ -495,23 +505,53 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             background = triggerBackground(editing, running); elevation = dp(5).toFloat()
         }
         val params = overlayParams(size, size, Gravity.TOP or Gravity.START).apply {
-            x = (macro.trigger.x * w - size / 2f).toInt().coerceIn(0, (w - size).coerceAtLeast(0))
-            y = (macro.trigger.y * h - size / 2f).toInt().coerceIn(0, (h - size).coerceAtLeast(0))
+            // WindowManager x/y live in the overlay parent frame. This is only an
+            // initial estimate; alignTriggerToGlobalModel() corrects it after layout.
+            x = (desiredCenter.x - size / 2f).roundToInt().coerceIn(0, (screenW - size).coerceAtLeast(0))
+            y = (desiredCenter.y - size / 2f).roundToInt().coerceIn(0, (screenH - size).coerceAtLeast(0))
             if (uiMode != UiMode.MACROS) {
                 flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                // Android 12+ may reject touches through a non-touchable application
-                // overlay when the overlay window itself is fully opaque. Background
-                // drawable alpha is not enough; the Window alpha must also be below
-                // the obscuring-touch threshold.
                 alpha = PASSTHROUGH_WINDOW_ALPHA
             }
         }
         if (uiMode == UiMode.MACROS) installTriggerTouch(view, params, macro, size)
-        wm.addView(view, params); triggerViews[macro.id] = view
+        wm.addView(view, params)
+        triggerViews[macro.id] = view
+        alignTriggerToGlobalModel(view, params, macro, generation)
+    }
+
+    /**
+     * Overlay LayoutParams are parent-frame coordinates, while macro geometry is
+     * full logical-screen coordinates. Measure the real window, then compensate
+     * the parent-frame offset. A second pass handles rounding/inset changes.
+     */
+    private fun alignTriggerToGlobalModel(
+        view: View,
+        params: WindowManager.LayoutParams,
+        macro: TouchMacro,
+        generation: Long,
+        pass: Int = 0,
+    ) {
+        view.post {
+            if (generation != triggerGeometryGeneration || !view.isAttachedToWindow) return@post
+            val actual = screenGeometry.globalBounds(view) ?: return@post
+            val desired = screenGeometry.toGlobal(macro.trigger.x, macro.trigger.y)
+            val dx = (desired.x - actual.centerX).roundToInt()
+            val dy = (desired.y - actual.centerY).roundToInt()
+            if ((dx != 0 || dy != 0) && pass < 2) {
+                params.x += dx
+                params.y += dy
+                runCatching { wm.updateViewLayout(view, params) }
+                alignTriggerToGlobalModel(view, params, macro, generation, pass + 1)
+            } else {
+                syncRuntimeTriggerRegions(generation)
+            }
+        }
     }
 
     private fun installTriggerTouch(view: View, params: WindowManager.LayoutParams, macro: TouchMacro, size: Int) {
         var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var moved = false; var holdStarted = false
+        var startGlobalBounds: LogicalScreenGeometry.Rect? = null
         var lastTapAt = 0L; var pendingSingle: Runnable? = null
         val editable = { uiMode == UiMode.MACROS }
         val holdRunnable = Runnable {
@@ -522,7 +562,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         view.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = e.rawX; downY = e.rawY; startX = params.x; startY = params.y; moved = false; holdStarted = false
+                    downX = e.rawX; downY = e.rawY; startX = params.x; startY = params.y
+                    startGlobalBounds = screenGeometry.globalBounds(view)
+                    moved = false; holdStarted = false
                     if (macro.trigger.mode == MacroTriggerMode.HOLD_REPEAT) main.postDelayed(holdRunnable, HOLD_TRIGGER_DELAY_MS)
                     true
                 }
@@ -533,9 +575,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                             moved = true; main.removeCallbacks(holdRunnable); pendingSingle?.let { main.removeCallbacks(it) }; pendingSingle = null; lastTapAt = 0L
                         }
                         if (moved && !holdStarted) {
-                            params.x = (startX + dx.toInt()).coerceIn(0, (resources.displayMetrics.widthPixels - size).coerceAtLeast(0))
-                            params.y = (startY + dy.toInt()).coerceIn(0, (resources.displayMetrics.heightPixels - size).coerceAtLeast(0))
-                            runCatching { wm.updateViewLayout(view, params) }
+                            val startBounds = startGlobalBounds
+                            if (startBounds != null) {
+                                val (screenW, screenH) = screenGeometry.size()
+                                val targetLeft = (startBounds.left + dx).coerceIn(0f, (screenW - size).coerceAtLeast(0).toFloat())
+                                val targetTop = (startBounds.top + dy).coerceIn(0f, (screenH - size).coerceAtLeast(0).toFloat())
+                                params.x = startX + (targetLeft - startBounds.left).roundToInt()
+                                params.y = startY + (targetTop - startBounds.top).roundToInt()
+                                runCatching { wm.updateViewLayout(view, params) }
+                            }
                         }
                     }
                     true
@@ -544,9 +592,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                     main.removeCallbacks(holdRunnable)
                     when {
                         editable() && moved && !holdStarted -> {
-                            val sw = resources.displayMetrics.widthPixels.toFloat(); val sh = resources.displayMetrics.heightPixels.toFloat()
-                            macro.trigger.x = ((params.x + size / 2f) / sw).coerceIn(0f, 1f)
-                            macro.trigger.y = ((params.y + size / 2f) / sh).coerceIn(0f, 1f); saveProfiles()
+                            screenGeometry.normalizedCenter(view)?.let { center ->
+                                macro.trigger.x = center.x
+                                macro.trigger.y = center.y
+                                saveProfiles()
+                            }
                         }
                         holdStarted -> macroRunner.stop()
                         e.actionMasked == MotionEvent.ACTION_UP -> {
@@ -830,12 +880,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         onConfirm: (Pair<Float, Float>, Pair<Float, Float>?) -> Unit,
     ) {
         hideMacroEditor(); hideRecordingPicker(); hideMacroManager(); hideMainMenu(); hideTriggerButtons(); removePositionEditor()
-        val screenW = resources.displayMetrics.widthPixels
-        val screenH = resources.displayMetrics.heightPixels
-        var globalStartX = start.first.coerceIn(0f, 1f) * screenW
-        var globalStartY = start.second.coerceIn(0f, 1f) * screenH
-        var globalEndX = (end?.first ?: start.first).coerceIn(0f, 1f) * screenW
-        var globalEndY = (end?.second ?: start.second).coerceIn(0f, 1f) * screenH
+        val (screenW, screenH) = screenGeometry.size()
+        val startGlobal = screenGeometry.toGlobal(start.first, start.second)
+        val endGlobal = screenGeometry.toGlobal(end?.first ?: start.first, end?.second ?: start.second)
+        var globalStartX = startGlobal.x
+        var globalStartY = startGlobal.y
+        var globalEndX = endGlobal.x
+        var globalEndY = endGlobal.y
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.argb(12, 0, 0, 0)) }
         val guide = MacroGeometryGuideView(this).apply { arrowEnabled = end != null }
@@ -852,9 +903,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         root.addView(startHandle, FrameLayout.LayoutParams(handleSize, handleSize))
         if (endHandle != null) root.addView(endHandle, FrameLayout.LayoutParams(handleSize, handleSize))
 
-        fun origin(): Pair<Int, Int> {
-            val loc = IntArray(2); root.getLocationOnScreen(loc); return loc[0] to loc[1]
-        }
+        fun origin(): LogicalScreenGeometry.Point =
+            screenGeometry.globalOrigin(root) ?: LogicalScreenGeometry.Point(0f, 0f)
         fun update() {
             val (ox, oy) = origin()
             val sx = globalStartX - ox; val sy = globalStartY - oy
@@ -900,8 +950,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 removePositionEditor(); syncTriggerButtons(); editingMacroId?.let { findMacro(it)?.let(::showMacroEditor) }
             })
             addView(pill("确定", false, false) {
-                val a = (globalStartX / screenW).coerceIn(0f, 1f) to (globalStartY / screenH).coerceIn(0f, 1f)
-                val b = if (end != null) (globalEndX / screenW).coerceIn(0f, 1f) to (globalEndY / screenH).coerceIn(0f, 1f) else null
+                val startNormalized = screenGeometry.toNormalized(globalStartX, globalStartY)
+                val endNormalized = if (end != null) screenGeometry.toNormalized(globalEndX, globalEndY) else null
+                val a = startNormalized.x to startNormalized.y
+                val b = endNormalized?.let { it.x to it.y }
                 onConfirm(a, b)
                 removePositionEditor(); syncTriggerButtons(); editingMacroId?.let { findMacro(it)?.let(::showMacroEditor) }
             })
@@ -938,11 +990,12 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         wm.addView(view, params)
         recordingStopView = view
         view.post {
-            val loc = IntArray(2); view.getLocationOnScreen(loc)
-            requestAsync("RECORD_EXCLUDE ${loc[0]} ${loc[1]} ${loc[0] + view.width} ${loc[1] + view.height}") {
-                requestAsync("RECORD_START $name") {
-                    recording = true
-                    activeRecordingName = name
+            screenGeometry.globalBounds(view)?.let { bounds ->
+                requestAsync("RECORD_EXCLUDE ${bounds.left} ${bounds.top} ${bounds.right} ${bounds.bottom}") {
+                    requestAsync("RECORD_START $name") {
+                        recording = true
+                        activeRecordingName = name
+                    }
                 }
             }
         }
@@ -969,8 +1022,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         wm.addView(view, overlayParams(width, height, Gravity.TOP or Gravity.END).apply { x = right; y = top })
         recordingStopView = view
         view.post {
-            val loc = IntArray(2); view.getLocationOnScreen(loc)
-            requestAsync("RECORD_EXCLUDE ${loc[0]} ${loc[1]} ${loc[0] + view.width} ${loc[1] + view.height}") {}
+            screenGeometry.globalBounds(view)?.let { bounds ->
+                requestAsync("RECORD_EXCLUDE ${bounds.left} ${bounds.top} ${bounds.right} ${bounds.bottom}") {}
+            }
         }
     }
 
@@ -999,31 +1053,54 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         rawTriggerHoldStarted.clear()
     }
 
-    private fun syncRuntimeTriggerRegions() {
-        val regions = if (uiMode == UiMode.NONE && !recording && positionEditorView == null) {
-            val w = resources.displayMetrics.widthPixels
-            val h = resources.displayMetrics.heightPixels
-            activeProfile().macros.map { macro ->
-                val size = dp(macro.trigger.sizeDp).coerceAtLeast(dp(28))
-                val cx = macro.trigger.x * w
-                val cy = macro.trigger.y * h
-                val half = size / 2f
-                listOf(macro.id, cx - half, cy - half, cx + half, cy + half)
+    private fun syncRuntimeTriggerRegions(generation: Long = triggerGeometryGeneration) {
+        if (generation != triggerGeometryGeneration) return
+        val runtimeMode = uiMode == UiMode.NONE && !recording && positionEditorView == null
+        val regions = if (runtimeMode) {
+            val macros = activeProfile().macros
+            val measured = macros.mapNotNull { macro ->
+                val view = triggerViews[macro.id] ?: return@mapNotNull null
+                val bounds = screenGeometry.globalBounds(view) ?: return@mapNotNull null
+                RuntimeTriggerRegion(macro.id, bounds)
             }
-        } else emptyList()
+            // Never replace a complete runtime map with a partially laid-out one.
+            // The final trigger layout callback will retry after all views are ready.
+            if (measured.size != macros.size) return
+            measured
+        } else {
+            emptyList()
+        }
+        pushRuntimeTriggerRegions(regions)
+    }
+
+    private data class RuntimeTriggerRegion(
+        val id: String,
+        val bounds: LogicalScreenGeometry.Rect,
+    )
+
+    private fun pushRuntimeTriggerRegions(regions: List<RuntimeTriggerRegion>) {
+        val revision = ++triggerRegionRevision
+        val command = buildString {
+            append("TRIGGER_SET ").append(regions.size)
+            regions.forEach { region ->
+                append(' ').append(region.id)
+                append(' ').append(region.bounds.left)
+                append(' ').append(region.bounds.top)
+                append(' ').append(region.bounds.right)
+                append(' ').append(region.bounds.bottom)
+            }
+        }
         io.execute {
+            if (revision != triggerRegionRevision) return@execute
             runCatching {
                 if (!client.isConnected) client.connect()
-                val command = buildString {
-                    append("TRIGGER_SET ").append(regions.size)
-                    regions.forEach { r ->
-                        append(' ').append(r[0])
-                        append(' ').append(r[1]).append(' ').append(r[2])
-                        append(' ').append(r[3]).append(' ').append(r[4])
-                    }
-                }
+                if (revision != triggerRegionRevision) return@runCatching
                 client.request(command)
-            }.onFailure { t -> main.post { runtimeStatus = "触发器同步失败 · ${t.message ?: t.javaClass.simpleName}" } }
+            }.onFailure { t ->
+                if (revision == triggerRegionRevision) {
+                    main.post { runtimeStatus = "触发器同步失败 · ${t.message ?: t.javaClass.simpleName}" }
+                }
+            }
         }
     }
 

@@ -12,7 +12,7 @@ enum class MacroTriggerMode { CLICK_ONCE, HOLD_REPEAT }
 
 data class MacroTrigger(
     var mode: MacroTriggerMode = MacroTriggerMode.CLICK_ONCE,
-    /** Normalized trigger-button center in the logical display. */
+    /** Normalized trigger-button center in the full logical display. */
     var x: Float = 0.86f,
     var y: Float = 0.45f,
     /** Visual trigger diameter. */
@@ -52,12 +52,11 @@ data class MacroProfile(
     val macros: MutableList<TouchMacro> = mutableListOf(),
 )
 
-/** Profile-aware macro persistence. Existing v4 macros migrate once into 配置 1. */
+/** Profile-aware macro persistence using canonical global-screen coordinates. */
 class MacroStore(context: Context) {
-    private val prefs = context.getSharedPreferences("touch_macros", Context.MODE_PRIVATE)
-    private val profilesKey = "macro_profiles_v1"
-    private val activeProfileKey = "active_macro_profile_v1"
-    private val legacyKey = "macros_v4"
+    private val prefs = context.getSharedPreferences("touch_macros_v2", Context.MODE_PRIVATE)
+    private val profilesKey = "profiles"
+    private val activeProfileKey = "active_profile"
 
     fun loadProfiles(): MutableList<MacroProfile> {
         val stored = prefs.getString(profilesKey, null)
@@ -67,13 +66,7 @@ class MacroStore(context: Context) {
                 MutableList(array.length()) { i -> decodeProfile(array.getJSONObject(i)) }
             }.getOrElse { mutableListOf() }
         }
-
-        val legacy = prefs.getString(legacyKey, null)
-        val macros = if (legacy == null) mutableListOf() else runCatching {
-            val array = JSONArray(legacy)
-            MutableList(array.length()) { i -> decodeMacro(array.getJSONObject(i)) }
-        }.getOrElse { mutableListOf() }
-        val profiles = mutableListOf(MacroProfile(name = "配置 1", macros = macros))
+        val profiles = mutableListOf(MacroProfile(name = "配置 1"))
         saveProfiles(profiles)
         saveActiveProfileId(profiles.first().id)
         return profiles
