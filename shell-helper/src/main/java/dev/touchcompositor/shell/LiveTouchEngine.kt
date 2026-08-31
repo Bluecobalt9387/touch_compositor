@@ -78,6 +78,20 @@ class LiveTouchEngine(
         fun contains(x: Float, y: Float): Boolean = x in left..right && y in top..bottom
     }
 
+    data class TriggerRegion(val id: String, val left: Float, val top: Float, val right: Float, val bottom: Float) {
+        init {
+            require(id.matches(Regex("[A-Za-z0-9_-]{1,80}")))
+            require(left <= right && top <= bottom)
+        }
+        fun contains(x: Float, y: Float): Boolean = x in left..right && y in top..bottom
+    }
+
+    enum class TriggerAction { DOWN, UP, CANCEL }
+    data class TriggerEvent(val id: String, val action: TriggerAction)
+    private data class ConsumedTrigger(val id: String, val trackingId: Int)
+
+    @Volatile var triggerEventListener: ((TriggerEvent) -> Unit)? = null
+
     override val capabilities = TouchCapabilities(
         canReadPhysicalTouch = true,
         canGrabPhysicalTouch = true,
@@ -96,6 +110,8 @@ class LiveTouchEngine(
     private val physical = linkedMapOf<Int, ActivePointer>() // key = evdev slot
     private val synthetic = linkedMapOf<Int, ActivePointer>() // key = API external id
     private val playback = linkedMapOf<Int, ActivePointer>() // key = recorded external id
+    private val triggerRegions = mutableListOf<TriggerRegion>()
+    private val consumedTriggerSlots = linkedMapOf<Int, ConsumedTrigger>()
     private var currentRawSlot = 0
 
     private val running = AtomicBoolean(false)
@@ -188,16 +204,21 @@ class LiveTouchEngine(
             .associateByTo(linkedMapOf()) { it.slot }
             .mapValuesTo(linkedMapOf()) { it.value.copy() }
 
-        recordRawPhysical(current, now)
+        updateConsumedTriggers(current)
+        val replayCurrent = current
+            .filterKeys { it !in consumedTriggerSlots }
+            .toMap(linkedMapOf())
+
+        recordRawPhysical(replayCurrent, now)
 
         val removed = physical.keys.toList().filter { slot ->
             val p = physical[slot]
-            val c = current[slot]
+            val c = replayCurrent[slot]
             c == null || c.trackingId != p?.trackingId
         }
-        val added = current.keys.toList().filter { slot ->
+        val added = replayCurrent.keys.toList().filter { slot ->
             val p = physical[slot]
-            val c = current[slot]
+            val c = replayCurrent[slot]
             p == null || p.trackingId != c?.trackingId
         }
         var emittedIdentity = false
@@ -213,7 +234,7 @@ class LiveTouchEngine(
         }
 
         // Update surviving physical contacts before any new pointer is emitted.
-        current.forEach { (slot, raw) ->
+        replayCurrent.forEach { (slot, raw) ->
             val p = physical[slot]
             if (p != null && p.trackingId == raw.trackingId) {
                 p.state = raw.toPointerState(p.androidId)
@@ -221,7 +242,7 @@ class LiveTouchEngine(
         }
 
         for (slot in added.sorted()) {
-            val raw = current[slot] ?: continue
+            val raw = replayCurrent[slot] ?: continue
             val androidId = allocator.acquire(PointerOrigin.PHYSICAL, slot)
             val p = ActivePointer(
                 externalId = slot,
@@ -239,6 +260,35 @@ class LiveTouchEngine(
 
         if (!emittedIdentity && physical.isNotEmpty()) {
             emitCombined(TouchAction.MOVE, physical.values.first().androidId, now)
+        }
+    }
+
+    private fun updateConsumedTriggers(current: LinkedHashMap<Int, RawContact>) {
+        val ended = consumedTriggerSlots.entries.filter { (slot, consumed) ->
+            val raw = current[slot]
+            raw == null || raw.trackingId != consumed.trackingId
+        }
+        ended.forEach { (slot, consumed) ->
+            consumedTriggerSlots.remove(slot)
+            triggerEventListener?.invoke(TriggerEvent(consumed.id, TriggerAction.UP))
+        }
+
+        if (triggerRegions.isEmpty()) return
+        current.forEach { (slot, raw) ->
+            if (slot in consumedTriggerSlots) return@forEach
+            val existing = physical[slot]
+            if (existing != null && existing.trackingId == raw.trackingId) return@forEach
+            val logical = raw.toPointerState(-1)
+            val region = triggerRegions.lastOrNull { it.contains(logical.x, logical.y) } ?: return@forEach
+            consumedTriggerSlots[slot] = ConsumedTrigger(region.id, raw.trackingId)
+            triggerEventListener?.invoke(TriggerEvent(region.id, TriggerAction.DOWN))
+        }
+    }
+
+    fun setTriggerRegions(regions: List<TriggerRegion>) {
+        synchronized(lock) {
+            triggerRegions.clear()
+            triggerRegions.addAll(regions)
         }
     }
 
@@ -286,6 +336,11 @@ class LiveTouchEngine(
                 playback.clear()
                 allocator.reset()
             }
+            consumedTriggerSlots.values.forEach { consumed ->
+                triggerEventListener?.invoke(TriggerEvent(consumed.id, TriggerAction.CANCEL))
+            }
+            consumedTriggerSlots.clear()
+            triggerRegions.clear()
             displayWidth = width
             displayHeight = height
             displayRotation = rotation
@@ -552,7 +607,7 @@ class LiveTouchEngine(
     }
 
     fun status(): String = synchronized(lock) {
-        "physical=${physical.size} synthetic=${synthetic.size} playback=${playback.size} recording=${recorder != null} player=${player.state} display=${displayWidth}x${displayHeight} rotation=$displayRotation"
+        "physical=${physical.size} synthetic=${synthetic.size} playback=${playback.size} triggers=${triggerRegions.size} consumed=${consumedTriggerSlots.size} recording=${recorder != null} player=${player.state} display=${displayWidth}x${displayHeight} rotation=$displayRotation"
     }
 
     override fun close() {
@@ -580,6 +635,11 @@ class LiveTouchEngine(
             recordingRawLast.clear()
             recordingActive.clear()
             recordingExcludedSlots.clear()
+            consumedTriggerSlots.values.forEach { consumed ->
+                triggerEventListener?.invoke(TriggerEvent(consumed.id, TriggerAction.CANCEL))
+            }
+            consumedTriggerSlots.clear()
+            triggerRegions.clear()
         }
         runCatching { process?.destroy() }
         runCatching { readerThread?.join(1000) }

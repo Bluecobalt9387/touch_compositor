@@ -76,7 +76,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var editingMacroId: String? = null
     private var selectedActionIndex: Int? = null
     private var runningMacroId: String? = null
-    private var macroInputPassthrough = false
+    private val rawTriggerHoldRunnables = mutableMapOf<String, Runnable>()
+    private val rawTriggerHoldStarted = mutableSetOf<String>()
+    private var entryPassthroughForMacro = false
 
     private val ink = Color.rgb(28, 31, 36)
     private val muted = Color.rgb(110, 116, 126)
@@ -116,6 +118,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     override fun onDestroy() {
         serviceDestroying = true
+        cancelRawTriggerHolds()
         macroRunner.close()
         removeAllWindows()
         client.close()
@@ -193,16 +196,56 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         }
     }
 
-    override fun onEvent(line: String) = Unit
+    override fun onEvent(line: String) {
+        main.post {
+            val parts = line.split(' ')
+            val id = parts.getOrNull(1) ?: return@post
+            when (parts.firstOrNull()) {
+                "TRIGGER_DOWN" -> handleRawTriggerDown(id)
+                "TRIGGER_UP" -> handleRawTriggerUp(id, cancelled = false)
+                "TRIGGER_CANCEL" -> handleRawTriggerUp(id, cancelled = true)
+            }
+        }
+    }
 
     override fun onMacroStarted(name: String) = Unit
 
     override fun onMacroFinished(name: String, stopped: Boolean, error: String?) {
         main.post {
-            setMacroInputPassthrough(false)
             runningMacroId = null
+            rawTriggerHoldStarted.clear()
+            setEntryPassthrough(false)
             if (error != null) runtimeStatus = "宏错误 · $error"
             syncTriggerButtons()
+        }
+    }
+
+    private fun handleRawTriggerDown(id: String) {
+        if (uiMode != UiMode.NONE || recording) return
+        val macro = activeProfile().macros.firstOrNull { it.id == id } ?: return
+        triggerViews[id]?.background = triggerBackground(false, false)
+        if (macro.trigger.mode != MacroTriggerMode.HOLD_REPEAT) return
+        rawTriggerHoldRunnables.remove(id)?.let(main::removeCallbacks)
+        val runnable = Runnable {
+            rawTriggerHoldRunnables.remove(id)
+            if (uiMode == UiMode.NONE && !macroRunner.isRunning && startMacro(macro, true, triggerViews[id])) {
+                rawTriggerHoldStarted += id
+            }
+        }
+        rawTriggerHoldRunnables[id] = runnable
+        main.postDelayed(runnable, HOLD_TRIGGER_DELAY_MS)
+    }
+
+    private fun handleRawTriggerUp(id: String, cancelled: Boolean) {
+        rawTriggerHoldRunnables.remove(id)?.let(main::removeCallbacks)
+        val macro = activeProfile().macros.firstOrNull { it.id == id } ?: return
+        if (id in rawTriggerHoldStarted) {
+            rawTriggerHoldStarted.remove(id)
+            if (runningMacroId == id) macroRunner.stop()
+            return
+        }
+        if (!cancelled && uiMode == UiMode.NONE && macro.trigger.mode == MacroTriggerMode.CLICK_ONCE && !macroRunner.isRunning) {
+            startMacro(macro, false, triggerViews[id])
         }
     }
 
@@ -241,6 +284,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val params = overlayParams(w, h, Gravity.TOP or Gravity.START).apply {
             x = ((resources.displayMetrics.widthPixels - w) / 2).coerceAtLeast(0)
             y = dp(2)
+            if (entryPassthroughForMacro) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         }
         wm.addView(view, params)
         entryView = view
@@ -295,6 +339,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun enterMacroEditMode() {
+        cancelRawTriggerHolds()
         hideRecordingManager()
         hideMacroManager()
         hideNameEditor()
@@ -305,6 +350,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun exitMacroEditMode(nextMode: UiMode) {
+        cancelRawTriggerHolds()
         hideMacroEditor()
         hideRecordingPicker()
         hideNameEditor()
@@ -413,8 +459,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     private fun syncTriggerButtons() {
         hideTriggerButtons()
-        if (!Settings.canDrawOverlays(this) || recording || positionEditorView != null) return
-        activeProfile().macros.forEachIndexed { index, macro -> showMacroTrigger(macro, index) }
+        if (Settings.canDrawOverlays(this) && !recording && positionEditorView == null) {
+            activeProfile().macros.forEachIndexed { index, macro -> showMacroTrigger(macro, index) }
+        }
+        syncRuntimeTriggerRegions()
     }
 
     private fun hideTriggerButtons() {
@@ -437,8 +485,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val params = overlayParams(size, size, Gravity.TOP or Gravity.START).apply {
             x = (macro.trigger.x * w - size / 2f).toInt().coerceIn(0, (w - size).coerceAtLeast(0))
             y = (macro.trigger.y * h - size / 2f).toInt().coerceIn(0, (h - size).coerceAtLeast(0))
+            if (uiMode != UiMode.MACROS) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         }
-        installTriggerTouch(view, params, macro, size)
+        if (uiMode == UiMode.MACROS) installTriggerTouch(view, params, macro, size)
         wm.addView(view, params); triggerViews[macro.id] = view
     }
 
@@ -509,13 +558,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun startMacro(macro: TouchMacro, repeat: Boolean, source: View?): Boolean = runCatching {
-        setMacroInputPassthrough(true)
-        macroRunner.start(macro, repeat)
-        runningMacroId = macro.id
-        source?.background = triggerBackground(uiMode == UiMode.MACROS && editingMacroId == macro.id, true)
-        true
+        if (uiMode == UiMode.NONE) setEntryPassthrough(true)
+        macroRunner.start(macro, repeat); runningMacroId = macro.id
+        source?.background = triggerBackground(uiMode == UiMode.MACROS && editingMacroId == macro.id, true); true
     }.getOrElse {
-        setMacroInputPassthrough(false)
+        setEntryPassthrough(false)
         source?.background = rounded(Color.argb(205, 204, 66, 63), macro.trigger.sizeDp / 2f)
         source?.postDelayed({ source.background = triggerBackground(false, false) }, 550)
         runtimeStatus = "宏错误 · ${it.message ?: it.javaClass.simpleName}"; false
@@ -926,6 +973,54 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private fun setRecordingLabel(name: String, label: String) { recordingLabels.edit().putString(name, label.trim().ifBlank { name }).apply() }
 
 
+    private fun cancelRawTriggerHolds() {
+        rawTriggerHoldRunnables.values.forEach(main::removeCallbacks)
+        rawTriggerHoldRunnables.clear()
+        if (rawTriggerHoldStarted.isNotEmpty()) macroRunner.stop()
+        rawTriggerHoldStarted.clear()
+    }
+
+    private fun syncRuntimeTriggerRegions() {
+        val regions = if (uiMode == UiMode.NONE && !recording && positionEditorView == null) {
+            val w = resources.displayMetrics.widthPixels
+            val h = resources.displayMetrics.heightPixels
+            activeProfile().macros.map { macro ->
+                val size = dp(macro.trigger.sizeDp).coerceAtLeast(dp(28))
+                val cx = macro.trigger.x * w
+                val cy = macro.trigger.y * h
+                val half = size / 2f
+                listOf(macro.id, cx - half, cy - half, cx + half, cy + half)
+            }
+        } else emptyList()
+        io.execute {
+            runCatching {
+                if (!client.isConnected) client.connect()
+                val command = buildString {
+                    append("TRIGGER_SET ").append(regions.size)
+                    regions.forEach { r ->
+                        append(' ').append(r[0])
+                        append(' ').append(r[1]).append(' ').append(r[2])
+                        append(' ').append(r[3]).append(' ').append(r[4])
+                    }
+                }
+                client.request(command)
+            }.onFailure { t -> main.post { runtimeStatus = "触发器同步失败 · ${t.message ?: t.javaClass.simpleName}" } }
+        }
+    }
+
+    private fun setEntryPassthrough(enabled: Boolean) {
+        if (entryPassthroughForMacro == enabled) return
+        entryPassthroughForMacro = enabled
+        val view = entryView ?: return
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return
+        params.flags = if (enabled) {
+            params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        }
+        runCatching { wm.updateViewLayout(view, params) }
+    }
+
     private fun requestStatus() = requestAsync("STATUS") { runtimeStatus = it }
 
     private fun requestAsync(command: String, onSuccess: (String) -> Unit) {
@@ -937,36 +1032,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 .onFailure { t -> main.post { runtimeStatus = "错误 · ${t.message ?: t.javaClass.simpleName}" } }
         }
     }
-
-    private fun setMacroInputPassthrough(enabled: Boolean) {
-        if (macroInputPassthrough == enabled) return
-        macroInputPassthrough = enabled
-        currentOverlayWindows().forEach { view ->
-            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@forEach
-            val newFlags = if (enabled) {
-                params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            } else {
-                params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-            }
-            if (newFlags != params.flags) {
-                params.flags = newFlags
-                runCatching { wm.updateViewLayout(view, params) }
-            }
-        }
-    }
-
-    private fun currentOverlayWindows(): List<View> = buildList {
-        entryView?.let(::add)
-        addAll(menuViews)
-        recordingManagerView?.let(::add)
-        macroManagerView?.let(::add)
-        editorView?.let(::add)
-        recordingPickerView?.let(::add)
-        nameEditorView?.let(::add)
-        recordingStopView?.let(::add)
-        positionEditorView?.let(::add)
-        addAll(triggerViews.values)
-    }.distinct()
 
     private fun removeAllWindows() {
         hideMainMenu(); hideRecordingManager(); hideMacroManager(); hideMacroEditor(); hideRecordingPicker(); hideNameEditor(); hideTriggerButtons()
@@ -1044,8 +1109,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     private fun focusableOverlayParams(width: Int, height: Int, gravity: Int) = WindowManager.LayoutParams(
         width, height, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        (WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) or
-            (if (macroInputPassthrough) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
         PixelFormat.TRANSLUCENT,
     ).apply { this.gravity = gravity; softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE }
 
@@ -1109,8 +1173,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         width,
         height,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-        (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) or
-            (if (macroInputPassthrough) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT,
     ).apply { this.gravity = gravity }
 

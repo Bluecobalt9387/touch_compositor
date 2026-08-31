@@ -3,24 +3,31 @@ package dev.touchcompositor.shell
 import android.os.Build
 import android.view.InputEvent
 
-/** Shell-side InputManager injection used by both compositor and isolated macro streams. */
+/** Matches the proven shell-side injection strategy used by the reference APK. */
 class InputInjectorCompat {
     private val manager: Any
     private val injectMethod: java.lang.reflect.Method
 
     init {
-        val cls = if (Build.VERSION.SDK_INT <= 33) {
-            Class.forName("android.hardware.input.InputManager")
+        if (Build.VERSION.SDK_INT <= 33) {
+            val cls = Class.forName("android.hardware.input.InputManager")
+            manager = cls.getDeclaredMethod("getInstance").invoke(null)
+                ?: error("InputManager.getInstance() returned null")
+            injectMethod = cls.getMethod(
+                "injectInputEvent",
+                InputEvent::class.java,
+                Int::class.javaPrimitiveType,
+            )
         } else {
-            Class.forName("android.hardware.input.InputManagerGlobal")
+            val cls = Class.forName("android.hardware.input.InputManagerGlobal")
+            manager = cls.getDeclaredMethod("getInstance").invoke(null)
+                ?: error("InputManagerGlobal.getInstance() returned null")
+            injectMethod = cls.getMethod(
+                "injectInputEvent",
+                InputEvent::class.java,
+                Int::class.javaPrimitiveType,
+            )
         }
-        manager = cls.getDeclaredMethod("getInstance").invoke(null)
-            ?: error("${cls.simpleName}.getInstance() returned null")
-        injectMethod = cls.getMethod(
-            "injectInputEvent",
-            InputEvent::class.java,
-            Int::class.javaPrimitiveType,
-        )
     }
 
     fun inject(event: InputEvent, mode: Int = 1): Boolean =
