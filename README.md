@@ -1,20 +1,51 @@
-# touch_compositor
+# Touch Compositor
 
-Android input automation research project focused on composable multi-touch rather than Accessibility `dispatchGesture()`.
+Android multi-touch composition and macro playback without Accessibility `dispatchGesture()`.
+
+The app pairs with the device's Wireless ADB service, starts a small `app_process` runtime as Android `shell`, reads physical touch input from evdev, composes physical and macro pointers, then injects one unified `MotionEvent` stream back into Display 0.
 
 ## Modules
 
-- `app`: UI, profiles, foreground service, overlay configuration.
-- `core-adb`: Wireless ADB pairing/transport. Deliberately no arbitrary shell API.
-- `core-input`: touch model, routing and compositor state.
-- `shell-helper`: `app_process` helper intended to run as Android `shell` and own InputMonitor/InputManager access.
+- `app` — Android UI, floating overlay, macro/profile editing and runtime lifecycle.
+- `core-adb` — Wireless ADB pairing, mDNS discovery and persistent transport.
+- `core-input` — touch frames, recording/playback, routing and coordinate model.
+- `shell-helper` — shell-side evdev reader, compositor, trigger routing and input injection.
+- `hidden-api-stubs` — compile-time Android hidden API stubs.
+- `native-tools` — native evdev helper sources and build script.
 
-## Initial milestones
+## Input model
 
-1. Validate `InputMonitor` under `uid=2000(shell)` on Huawei Android 12.
-2. Implement typed App ↔ Shell Helper IPC.
-3. Implement multi-pointer MotionEvent compositor and injection.
-4. Add non-touchable overlay indicators and PASS/CONSUME regions.
-5. Add DirectADB pairing/reconnect with mDNS discovery.
+All runtime geometry uses Display 0 logical-screen coordinates.
 
-The automation layer comes after the input substrate is proven.
+- Physical evdev coordinates are normalized from the device's real axis min/max range.
+- Rotation is applied once when converting raw touch to current screen coordinates.
+- Recordings persist normalized full-screen coordinates and replay into the current display geometry.
+- Macro touch and physical touch share the same compositor, so macro input does not need to cancel the user's active pointers.
+- Trigger regions are handled by the shell runtime rather than by re-injecting touches into the overlay window.
+
+## Build
+
+Requirements: JDK 17+ and Android SDK 35.
+
+```bash
+./gradlew test
+./gradlew assembleDebug
+```
+
+Release builds produced by Gradle are unsigned unless a signing configuration is supplied separately:
+
+```bash
+./gradlew assembleRelease
+```
+
+Local SDK paths belong in `local.properties` and are not committed.
+
+## Runtime
+
+On first use, enable Android Developer Options and Wireless debugging, then pair from the app using the system pairing code. The app persists its own ADB identity and can reconnect through mDNS discovery on later launches.
+
+The shell helper exposes only the typed touch-runtime protocol used by the app; `core-adb` deliberately does not provide an arbitrary shell-command API.
+
+## Debugging coordinates
+
+The debug build includes `CoordinateProbeActivity`, a simple full-screen touch target for checking injected Display 0 coordinates on real devices.

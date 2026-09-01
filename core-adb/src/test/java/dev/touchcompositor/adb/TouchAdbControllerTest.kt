@@ -38,9 +38,30 @@ class TouchAdbControllerTest {
         """.trimIndent()
         val result = TouchAdbController.parseTouchscreen(dump)!!
         assertEquals("/dev/input/event5", result.devicePath)
+        assertEquals(0, result.rawMinX)
         assertEquals(12599, result.rawMaxX)
+        assertEquals(0, result.rawMinY)
         assertEquals(27999, result.rawMaxY)
         assertTrue(result.hasPressure)
+    }
+
+    @Test
+    fun preservesNonZeroTouchscreenAxisMinimums() {
+        val dump = """
+            add device 1: /dev/input/event2
+              events:
+                ABS (0003): ABS_MT_SLOT           : value 0, min 0, max 9, fuzz 0, flat 0, resolution 0
+                            ABS_MT_POSITION_X     : value 0, min 120, max 8120, fuzz 0, flat 0, resolution 0
+                            ABS_MT_POSITION_Y     : value 0, min -20, max 15980, fuzz 0, flat 0, resolution 0
+                            ABS_MT_TRACKING_ID    : value 0, min 0, max 65535, fuzz 0, flat 0, resolution 0
+              input props:
+                INPUT_PROP_DIRECT
+        """.trimIndent()
+        val result = TouchAdbController.parseTouchscreen(dump)!!
+        assertEquals(120, result.rawMinX)
+        assertEquals(8120, result.rawMaxX)
+        assertEquals(-20, result.rawMinY)
+        assertEquals(15980, result.rawMaxY)
     }
 
     @Test

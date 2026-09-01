@@ -64,15 +64,17 @@ class TouchRecorder {
     fun record(frame: ComposedFrame) {
         val m = metadata ?: return
         val scale = minOf(m.displayWidth, m.displayHeight).toFloat()
+        val display = DisplayGeometry(m.displayWidth, m.displayHeight, m.rotation)
         frames += RecordedFrame(
             offsetNanos = (frame.eventTimeNanos - startedAtNanos).coerceAtLeast(0L),
             action = frame.action,
             changedPointerId = frame.changedPointerId,
             pointers = frame.pointers.map { p ->
+                val normalized = display.screenToNormalized(p.x, p.y)
                 RecordedPointer(
                     id = p.id,
-                    x = (p.x / m.displayWidth).coerceIn(0f, 1f),
-                    y = (p.y / m.displayHeight).coerceIn(0f, 1f),
+                    x = normalized.x,
+                    y = normalized.y,
                     pressure = p.pressure,
                     size = p.size,
                     touchMajor = p.touchMajor / scale,

@@ -190,9 +190,7 @@ class MacroStore(context: Context) {
 }
 
 /** Sequential macro executor. Recording playback uses a second control connection so HOLD_REPEAT can stop immediately. */
-class MacroRunner(
-    private val screenSize: () -> Pair<Int, Int>,
-) : AutoCloseable {
+class MacroRunner : AutoCloseable {
     interface Listener {
         fun onMacroStarted(name: String) {}
         fun onMacroFinished(name: String, stopped: Boolean, error: String?) {}
@@ -251,17 +249,20 @@ class MacroRunner(
     private fun execute(action: MacroAction) {
         when (action) {
             is MacroAction.Tap -> {
-                val (x, y) = px(action.x, action.y)
+                val x = action.x.coerceIn(0f, 1f)
+                val y = action.y.coerceIn(0f, 1f)
                 val pointerId = 10_001
-                execClient.request("DOWN $pointerId $x $y")
+                execClient.request("DOWN_N $pointerId $x $y")
                 sleepInterruptibly(action.holdMs)
-                if (!stopRequested.get()) execClient.request("UP $pointerId $x $y")
+                if (!stopRequested.get()) execClient.request("UP_N $pointerId $x $y")
             }
             is MacroAction.Drag -> {
-                val (x1, y1) = px(action.x1, action.y1)
-                val (x2, y2) = px(action.x2, action.y2)
+                val x1 = action.x1.coerceIn(0f, 1f)
+                val y1 = action.y1.coerceIn(0f, 1f)
+                val x2 = action.x2.coerceIn(0f, 1f)
+                val y2 = action.y2.coerceIn(0f, 1f)
                 val pointerId = 10_001
-                execClient.request("DOWN $pointerId $x1 $y1")
+                execClient.request("DOWN_N $pointerId $x1 $y1")
                 val frames = ceil(action.durationMs / 16.0).toInt().coerceAtLeast(1)
                 val started = SystemClock.uptimeMillis()
                 for (i in 1..frames) {
@@ -269,12 +270,12 @@ class MacroRunner(
                     val t = i.toFloat() / frames.toFloat()
                     val x = x1 + (x2 - x1) * t
                     val y = y1 + (y2 - y1) * t
-                    execClient.request("MOVE $pointerId $x $y")
+                    execClient.request("MOVE_N $pointerId $x $y")
                     val due = started + action.durationMs * i / frames
                     val remain = due - SystemClock.uptimeMillis()
                     if (remain > 0) sleepInterruptibly(remain)
                 }
-                if (!stopRequested.get()) execClient.request("UP $pointerId $x2 $y2")
+                if (!stopRequested.get()) execClient.request("UP_N $pointerId $x2 $y2")
             }
             is MacroAction.Wait -> sleepInterruptibly(action.durationMs)
             is MacroAction.Recording -> {
@@ -284,10 +285,6 @@ class MacroRunner(
         }
     }
 
-    private fun px(nx: Float, ny: Float): Pair<Float, Float> {
-        val (w, h) = screenSize()
-        return nx.coerceIn(0f, 1f) * w to ny.coerceIn(0f, 1f) * h
-    }
 
     private fun ensureExecClient() {
         if (!execClient.isConnected) execClient.connect()

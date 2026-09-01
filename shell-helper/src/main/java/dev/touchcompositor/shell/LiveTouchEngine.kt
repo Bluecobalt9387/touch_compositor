@@ -4,6 +4,9 @@ import dev.touchcompositor.input.ComposedFrame
 import dev.touchcompositor.input.PlaybackOptions
 import dev.touchcompositor.input.PlaybackResult
 import dev.touchcompositor.input.PlaybackTarget
+import dev.touchcompositor.input.DisplayGeometry
+import dev.touchcompositor.input.RawAxisRange
+import dev.touchcompositor.input.RawTouchGeometry
 import dev.touchcompositor.input.PointerIdAllocator
 import dev.touchcompositor.input.PointerOrigin
 import dev.touchcompositor.input.PointerState
@@ -31,8 +34,10 @@ import kotlin.math.max
  */
 class LiveTouchEngine(
     private val devicePath: String,
-    private val rawMaxX: Int,
-    private val rawMaxY: Int,
+    rawMinX: Int,
+    rawMaxX: Int,
+    rawMinY: Int,
+    rawMaxY: Int,
     private val baseDisplayWidth: Int,
     private val baseDisplayHeight: Int,
     initialRotation: Int,
@@ -102,9 +107,18 @@ class LiveTouchEngine(
     )
 
     private val lock = Any()
-    private var displayWidth = if (initialRotation == 90 || initialRotation == 270) baseDisplayHeight else baseDisplayWidth
-    private var displayHeight = if (initialRotation == 90 || initialRotation == 270) baseDisplayWidth else baseDisplayHeight
-    private var displayRotation = initialRotation
+    private val rawGeometry = RawTouchGeometry(
+        RawAxisRange(rawMinX, rawMaxX),
+        RawAxisRange(rawMinY, rawMaxY),
+    )
+    private var displayGeometry = DisplayGeometry(
+        width = if (initialRotation == 90 || initialRotation == 270) baseDisplayHeight else baseDisplayWidth,
+        height = if (initialRotation == 90 || initialRotation == 270) baseDisplayWidth else baseDisplayHeight,
+        rotation = initialRotation,
+    )
+    private val displayWidth: Int get() = displayGeometry.width
+    private val displayHeight: Int get() = displayGeometry.height
+    private val displayRotation: Int get() = displayGeometry.rotation
     private val allocator = PointerIdAllocator(32)
     private val rawSlots = linkedMapOf<Int, RawContact>()
     private val physical = linkedMapOf<Int, ActivePointer>() // key = evdev slot
@@ -293,16 +307,8 @@ class LiveTouchEngine(
     }
 
     private fun RawContact.toPointerState(androidId: Int): PointerState {
-        val u = x.toFloat() / (rawMaxX + 1).toFloat()
-        val v = y.toFloat() / (rawMaxY + 1).toFloat()
-        val (logicalX, logicalY) = when (displayRotation) {
-            0 -> u * displayWidth to v * displayHeight
-            90 -> v * displayWidth to (1f - u) * displayHeight
-            180 -> (1f - u) * displayWidth to (1f - v) * displayHeight
-            270 -> (1f - v) * displayWidth to u * displayHeight
-            else -> error("unsupported display rotation $displayRotation")
-        }
-        return pointerState(androidId, logicalX, logicalY)
+        val screen = displayGeometry.rawToScreen(x, y, rawGeometry)
+        return pointerState(androidId, screen.x, screen.y)
     }
 
     private fun RawContact.pointerState(androidId: Int, x: Float, y: Float): PointerState {
@@ -341,10 +347,12 @@ class LiveTouchEngine(
             }
             consumedTriggerSlots.clear()
             triggerRegions.clear()
-            displayWidth = width
-            displayHeight = height
-            displayRotation = rotation
+            displayGeometry = DisplayGeometry(width, height, rotation)
         }
+    }
+
+    fun normalizedToScreen(x: Float, y: Float): DisplayGeometry.Point = synchronized(lock) {
+        displayGeometry.normalizedToScreen(x, y)
     }
 
     override fun down(pointerId: Int, x: Float, y: Float, attributes: TouchAttributes) {

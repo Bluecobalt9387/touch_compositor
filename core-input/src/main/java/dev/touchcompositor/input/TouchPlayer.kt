@@ -122,11 +122,13 @@ private fun RecordedFrame.toComposedFrame(
     pointerIdOffset: Int,
 ): ComposedFrame {
     val scale = minOf(target.displayWidth, target.displayHeight).toFloat()
+    val display = DisplayGeometry(target.displayWidth, target.displayHeight, target.rotation)
     val pointers = pointers.map { p ->
+        val screen = display.normalizedToScreen(p.x, p.y)
         PointerState(
             id = p.id + pointerIdOffset,
-            x = p.x * target.displayWidth,
-            y = p.y * target.displayHeight,
+            x = screen.x,
+            y = screen.y,
             pressure = p.pressure,
             size = p.size,
             touchMajor = p.touchMajor * scale,

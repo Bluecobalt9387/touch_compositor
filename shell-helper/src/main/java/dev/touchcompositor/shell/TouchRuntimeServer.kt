@@ -114,31 +114,29 @@ class TouchRuntimeServer(
             "CAPS" -> with(engine.capabilities) {
                 ok(out, "read=$canReadPhysicalTouch grab=$canGrabPhysicalTouch inject=$canInjectTouch compose=$canComposePhysicalAndSynthetic max=$maxPointers pressure=$hasHardwarePressure")
             }
-            "DISPLAY" -> {
-                require(a.size == 4) { "DISPLAY <width> <height> <rotation>" }
-                val width = a[1].toInt()
-                val height = a[2].toInt()
-                val rotation = a[3].toInt()
-                require(rotation in setOf(0, 90, 180, 270)) { "rotation must be 0/90/180/270" }
-                engine.updateDisplay(width, height, rotation)
-                engine.setTriggerRegions(triggerRegionsSnapshot)
-                currentDisplayWidth = width
-                currentDisplayHeight = height
-                currentRotation = rotation
-                ok(out, "DISPLAY ${width}x${height} rotation=$rotation")
+            "DISPLAY_STATE" -> {
+                require(a.size == 1) { "DISPLAY_STATE" }
+                ok(out, "DISPLAY ${currentDisplayWidth} ${currentDisplayHeight} ${currentRotation}")
             }
-            "DOWN", "MOVE", "UP" -> {
+            "DOWN", "MOVE", "UP", "DOWN_N", "MOVE_N", "UP_N" -> {
                 require(a.size in 4..10) { "${a[0]} <id> <x> <y> [pressure size touchMajor touchMinor toolMajor toolMinor]" }
+                val command = a[0].uppercase()
                 val id = a[1].toInt()
-                val x = a[2].toFloat()
-                val y = a[3].toFloat()
+                var x = a[2].toFloat()
+                var y = a[3].toFloat()
+                if (command.endsWith("_N")) {
+                    require(x in 0f..1f && y in 0f..1f) { "normalized coordinates must be in [0,1]" }
+                    val screen = engine.normalizedToScreen(x, y)
+                    x = screen.x
+                    y = screen.y
+                }
                 val attrs = parseAttributes(a.drop(4))
-                when (a[0].uppercase()) {
+                when (command.removeSuffix("_N")) {
                     "DOWN" -> engine.down(id, x, y, attrs)
                     "MOVE" -> engine.move(id, x, y, attrs)
                     "UP" -> engine.up(id, x, y, attrs)
                 }
-                ok(out, "${a[0].uppercase()} id=$id")
+                ok(out, "$command id=$id")
             }
             "RELEASE_ALL" -> {
                 engine.cancelAll()
@@ -283,10 +281,14 @@ class TouchRuntimeServer(
         displayWatcher = DisplayStateWatcher { width, height, rotation ->
             runCatching {
                 engine.updateDisplay(width, height, rotation)
-                engine.setTriggerRegions(triggerRegionsSnapshot)
                 currentDisplayWidth = width
                 currentDisplayHeight = height
                 currentRotation = rotation
+                // Trigger rectangles are screen-pixel geometry from the overlay.
+                // A rotation invalidates them until the app measures the new windows.
+                triggerRegionsSnapshot = emptyList()
+                engine.setTriggerRegions(emptyList())
+                broadcastEvent("DISPLAY_CHANGED $width $height $rotation")
             }.onFailure { t ->
                 System.err.println("DISPLAY_UPDATE_ERROR ${t.javaClass.simpleName}: ${t.message}")
             }

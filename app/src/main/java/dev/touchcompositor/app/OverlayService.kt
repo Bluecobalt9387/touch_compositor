@@ -96,14 +96,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         screenGeometry = LogicalScreenGeometry {
-            resources.displayMetrics.widthPixels to resources.displayMetrics.heightPixels
+            val bounds = wm.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
         }
         macroStore = MacroStore(this)
         profiles = macroStore.loadProfiles()
         ensureProfile()
         activeProfileId = macroStore.activeProfileId()?.takeIf { id -> profiles.any { it.id == id } }
             ?: profiles.first().id.also { macroStore.saveActiveProfileId(it) }
-        macroRunner = MacroRunner { screenGeometry.size() }.also { it.listener = this }
+        macroRunner = MacroRunner().also { it.listener = this }
         client.listener = this
         connectRuntime()
     }
@@ -112,7 +113,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         when (intent?.action) {
             ACTION_HIDE -> removeAllWindows()
             else -> if (Settings.canDrawOverlays(this)) {
-                syncDisplayConfig()
                 showEntry()
                 syncTriggerButtons()
             } else stopSelf()
@@ -135,7 +135,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         main.post {
-            syncDisplayConfig()
             hideMainMenu()
             hideRecordingManager()
             hideMacroManager()
@@ -171,7 +170,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onConnected(ready: String) {
         main.post {
             runtimeStatus = ready.removePrefix("READY touch-runtime-v1 ")
-            syncDisplayConfig()
             // Runtime state is ephemeral. A reconnect/restart loses raw trigger regions,
             // so always restore them from the current UI/profile state.
             syncRuntimeTriggerRegions()
@@ -208,11 +206,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     override fun onEvent(line: String) {
         main.post {
             val parts = line.split(' ')
-            val id = parts.getOrNull(1) ?: return@post
             when (parts.firstOrNull()) {
-                "TRIGGER_DOWN" -> handleRawTriggerDown(id)
-                "TRIGGER_UP" -> handleRawTriggerUp(id, cancelled = false)
-                "TRIGGER_CANCEL" -> handleRawTriggerUp(id, cancelled = true)
+                "DISPLAY_CHANGED" -> {
+                    // Runtime owns Display 0 state. Re-measure overlay windows so raw
+                    // trigger rectangles are regenerated in the new screen space.
+                    if (!recording && positionEditorView == null) syncTriggerButtons()
+                }
+                "TRIGGER_DOWN" -> parts.getOrNull(1)?.let(::handleRawTriggerDown)
+                "TRIGGER_UP" -> parts.getOrNull(1)?.let { handleRawTriggerUp(it, cancelled = false) }
+                "TRIGGER_CANCEL" -> parts.getOrNull(1)?.let { handleRawTriggerUp(it, cancelled = true) }
             }
         }
     }
@@ -225,7 +227,17 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             rawTriggerHoldStarted.clear()
             setEntryPassthrough(false)
             if (error != null) runtimeStatus = "宏错误 · $error"
-            syncTriggerButtons()
+            refreshTriggerVisuals()
+        }
+    }
+
+    /** Macro state changes must not recreate overlay windows: rebuilding a trigger
+     * briefly exposes WindowManager's parent-frame coordinates before global alignment. */
+    private fun refreshTriggerVisuals() {
+        triggerViews.forEach { (id, view) ->
+            val editing = uiMode == UiMode.MACROS && editingMacroId == id
+            val running = runningMacroId == id
+            view.background = triggerBackground(editing, running)
         }
     }
 
@@ -255,17 +267,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         }
         if (!cancelled && uiMode == UiMode.NONE && macro.trigger.mode == MacroTriggerMode.CLICK_ONCE && !macroRunner.isRunning) {
             startMacro(macro, false, triggerViews[id])
-        }
-    }
-
-    private fun syncDisplayConfig() {
-        if (!client.isConnected) return
-        val metrics = resources.displayMetrics
-        val rotation = when (wm.defaultDisplay.rotation) {
-            0 -> 0; 1 -> 90; 2 -> 180; 3 -> 270; else -> 0
-        }
-        requestAsync("DISPLAY ${metrics.widthPixels} ${metrics.heightPixels} $rotation") {
-            runtimeStatus = it
         }
     }
 
@@ -505,8 +506,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             background = triggerBackground(editing, running); elevation = dp(5).toFloat()
         }
         val params = overlayParams(size, size, Gravity.TOP or Gravity.START).apply {
-            // WindowManager x/y live in the overlay parent frame. This is only an
-            // initial estimate; alignTriggerToGlobalModel() corrects it after layout.
+            // Trigger geometry is full Display 0 screen space. Disable system-bar
+            // fitting for this window so TOP|START x/y use that same origin directly.
+            setFitInsetsTypes(0)
+            flags = flags or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             x = (desiredCenter.x - size / 2f).roundToInt().coerceIn(0, (screenW - size).coerceAtLeast(0))
             y = (desiredCenter.y - size / 2f).roundToInt().coerceIn(0, (screenH - size).coerceAtLeast(0))
             if (uiMode != UiMode.MACROS) {
@@ -517,33 +520,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         if (uiMode == UiMode.MACROS) installTriggerTouch(view, params, macro, size)
         wm.addView(view, params)
         triggerViews[macro.id] = view
-        alignTriggerToGlobalModel(view, params, macro, generation)
-    }
-
-    /**
-     * Overlay LayoutParams are parent-frame coordinates, while macro geometry is
-     * full logical-screen coordinates. Measure the real window, then compensate
-     * the parent-frame offset. A second pass handles rounding/inset changes.
-     */
-    private fun alignTriggerToGlobalModel(
-        view: View,
-        params: WindowManager.LayoutParams,
-        macro: TouchMacro,
-        generation: Long,
-        pass: Int = 0,
-    ) {
         view.post {
-            if (generation != triggerGeometryGeneration || !view.isAttachedToWindow) return@post
-            val actual = screenGeometry.globalBounds(view) ?: return@post
-            val desired = screenGeometry.toGlobal(macro.trigger.x, macro.trigger.y)
-            val dx = (desired.x - actual.centerX).roundToInt()
-            val dy = (desired.y - actual.centerY).roundToInt()
-            if ((dx != 0 || dy != 0) && pass < 2) {
-                params.x += dx
-                params.y += dy
-                runCatching { wm.updateViewLayout(view, params) }
-                alignTriggerToGlobalModel(view, params, macro, generation, pass + 1)
-            } else {
+            if (generation == triggerGeometryGeneration && view.isAttachedToWindow) {
                 syncRuntimeTriggerRegions(generation)
             }
         }

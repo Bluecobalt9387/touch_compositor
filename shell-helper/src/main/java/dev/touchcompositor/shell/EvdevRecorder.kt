@@ -1,6 +1,9 @@
 package dev.touchcompositor.shell
 
 import dev.touchcompositor.input.ComposedFrame
+import dev.touchcompositor.input.DisplayGeometry
+import dev.touchcompositor.input.RawAxisRange
+import dev.touchcompositor.input.RawTouchGeometry
 import dev.touchcompositor.input.PointerOrigin
 import dev.touchcompositor.input.PointerState
 import dev.touchcompositor.input.RecordingMetadata
@@ -18,8 +21,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Non-grabbing Type-B evdev recorder. Physical touches still reach Android normally. */
 class EvdevRecorder(
     private val devicePath: String,
-    private val rawMaxX: Int,
-    private val rawMaxY: Int,
+    rawMinX: Int,
+    rawMaxX: Int,
+    rawMinY: Int,
+    rawMaxY: Int,
     private val displayWidth: Int,
     private val displayHeight: Int,
     private val rotation: Int,
@@ -48,6 +53,9 @@ class EvdevRecorder(
         var pressure: Int = 0,
         var orientation: Int = 0,
     )
+
+    private val rawGeometry = RawTouchGeometry(RawAxisRange(rawMinX, rawMaxX), RawAxisRange(rawMinY, rawMaxY))
+    private val displayGeometry = DisplayGeometry(displayWidth, displayHeight, rotation)
 
     private val slots = linkedMapOf<Int, Contact>()
     private var previous = linkedMapOf<Int, Contact>()
@@ -187,19 +195,11 @@ class EvdevRecorder(
         .map { c ->
             val major = c.major.coerceAtLeast(1).toFloat()
             val pressure = if (c.pressure > 0) c.pressure.toFloat() else (major / 31f).coerceIn(0.05f, 1f)
-            val u = c.x.toFloat() / (rawMaxX + 1).toFloat()
-            val v = c.y.toFloat() / (rawMaxY + 1).toFloat()
-            val (logicalX, logicalY) = when (rotation) {
-                0 -> u * displayWidth to v * displayHeight
-                90 -> v * displayWidth to (1f - u) * displayHeight
-                180 -> (1f - u) * displayWidth to (1f - v) * displayHeight
-                270 -> (1f - v) * displayWidth to u * displayHeight
-                else -> error("unsupported rotation $rotation")
-            }
+            val screen = displayGeometry.rawToScreen(c.x, c.y, rawGeometry)
             PointerState(
                 id = c.slot,
-                x = logicalX,
-                y = logicalY,
+                x = screen.x,
+                y = screen.y,
                 pressure = pressure,
                 size = (major / 31f).coerceIn(0.01f, 1f),
                 touchMajor = major,

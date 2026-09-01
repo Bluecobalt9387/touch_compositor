@@ -19,31 +19,28 @@ object ShellInputService {
             "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
             "runtime" -> {
                 val a = args.drop(1)
-                require(a.size >= 7) { "runtime <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <rotation> <grabHelper> [hasPressure]" }
+                require(a.size >= 9) { "runtime <event> <rawMinX> <rawMaxX> <rawMinY> <rawMaxY> <displayW> <displayH> <rotation> <grabHelper> [hasPressure]" }
                 val engine = LiveTouchEngine(
                     devicePath = a[0],
-                    rawMaxX = a[1].toInt(),
-                    rawMaxY = a[2].toInt(),
-                    baseDisplayWidth = a[3].toInt(),
-                    baseDisplayHeight = a[4].toInt(),
-                    initialRotation = a[5].toInt(),
-                    grabHelperPath = a[6],
-                    hasHardwarePressure = a.getOrNull(7)?.toBooleanStrictOrNull() ?: false,
+                    rawMinX = a[1].toInt(), rawMaxX = a[2].toInt(),
+                    rawMinY = a[3].toInt(), rawMaxY = a[4].toInt(),
+                    baseDisplayWidth = a[5].toInt(), baseDisplayHeight = a[6].toInt(),
+                    initialRotation = a[7].toInt(), grabHelperPath = a[8],
+                    hasHardwarePressure = a.getOrNull(9)?.toBooleanStrictOrNull() ?: false,
                 )
-                TouchRuntimeServer(engine, a[3].toInt(), a[4].toInt(), a[5].toInt()).runStdio()
+                TouchRuntimeServer(engine, a[5].toInt(), a[6].toInt(), a[7].toInt()).runStdio()
             }
             "record-test" -> {
                 val a = args.drop(1)
-                require(a.size >= 7) { "record-test <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <rotation> <seconds>" }
+                require(a.size >= 9) { "record-test <event> <rawMinX> <rawMaxX> <rawMinY> <rawMaxY> <displayW> <displayH> <rotation> <seconds>" }
                 val out = "/data/local/tmp/touch_compositor_recording.tcr"
                 val recording = EvdevRecorder(
                     devicePath = a[0],
-                    rawMaxX = a[1].toInt(),
-                    rawMaxY = a[2].toInt(),
-                    displayWidth = a[3].toInt(),
-                    displayHeight = a[4].toInt(),
-                    rotation = a[5].toInt(),
-                ).recordTo(out, a[6].toInt())
+                    rawMinX = a[1].toInt(), rawMaxX = a[2].toInt(),
+                    rawMinY = a[3].toInt(), rawMaxY = a[4].toInt(),
+                    displayWidth = a[5].toInt(), displayHeight = a[6].toInt(),
+                    rotation = a[7].toInt(),
+                ).recordTo(out, a[8].toInt())
                 println("RECORDING_SAVED path=$out frames=${recording.frames.size} durationNanos=${recording.durationNanos}")
             }
             "play-test-recording" -> {
@@ -61,30 +58,32 @@ object ShellInputService {
             }
             "replay", "replay-demo" -> {
                 val a = args.drop(1)
-                require(a.size >= 6) { "replay <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper>" }
+                require(a.size >= 8) { "replay <event> <rawMinX> <rawMaxX> <rawMinY> <rawMaxY> <displayW> <displayH> <grabHelper>" }
                 EvdevReplayCompositor(
                     devicePath = a[0],
-                    rawMaxX = a[1].toInt(),
-                    rawMaxY = a[2].toInt(),
-                    displayWidth = a[3].toInt(),
-                    displayHeight = a[4].toInt(),
-                    grabHelperPath = a[5],
+                    rawMinX = a[1].toInt(), rawMaxX = a[2].toInt(),
+                    rawMinY = a[3].toInt(), rawMaxY = a[4].toInt(),
+                    displayWidth = a[5].toInt(), displayHeight = a[6].toInt(),
+                    grabHelperPath = a[7],
                     demoVirtualTap = args.firstOrNull() == "replay-demo",
                 ).run()
             }
             "runtime-tcp" -> {
                 val a = args.drop(1)
-                require(a.size >= 6) { "runtime-tcp <event> <rawMaxX> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port] [hasPressure]" }
+                require(a.size >= 8) { "runtime-tcp <event> <rawMinX> <rawMaxX> <rawMinY> <rawMaxY> <displayW> <displayH> <grabHelper> [rotation] [port] [hasPressure]" }
+                val rotation = a.getOrNull(8)?.toIntOrNull() ?: 0
                 LiveTouchEngine(
-                    devicePath = a[0], rawMaxX = a[1].toInt(), rawMaxY = a[2].toInt(),
-                    baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(), initialRotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
-                    grabHelperPath = a[5],
-                    hasHardwarePressure = a.getOrNull(8)?.toBooleanStrictOrNull() ?: false,
+                    devicePath = a[0],
+                    rawMinX = a[1].toInt(), rawMaxX = a[2].toInt(),
+                    rawMinY = a[3].toInt(), rawMaxY = a[4].toInt(),
+                    baseDisplayWidth = a[5].toInt(), baseDisplayHeight = a[6].toInt(),
+                    initialRotation = rotation, grabHelperPath = a[7],
+                    hasHardwarePressure = a.getOrNull(10)?.toBooleanStrictOrNull() ?: false,
                 ).let { engine ->
                     TouchRuntimeServer(
-                        engine = engine, baseDisplayWidth = a[3].toInt(), baseDisplayHeight = a[4].toInt(),
-                        initialRotation = a.getOrNull(6)?.toIntOrNull() ?: 0,
-                    ).runTcp(a.getOrNull(7)?.toIntOrNull() ?: TouchRuntimeServer.DEFAULT_PORT)
+                        engine = engine, baseDisplayWidth = a[5].toInt(), baseDisplayHeight = a[6].toInt(),
+                        initialRotation = rotation,
+                    ).runTcp(a.getOrNull(9)?.toIntOrNull() ?: TouchRuntimeServer.DEFAULT_PORT)
                 }
             }
             else -> println("touch_compositor shell helper: ready")

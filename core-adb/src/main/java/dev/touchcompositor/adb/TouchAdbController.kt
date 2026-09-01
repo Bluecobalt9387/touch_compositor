@@ -25,7 +25,9 @@ class TouchAdbController(context: Context) : AutoCloseable {
 
     data class TouchscreenProbe(
         val devicePath: String,
+        val rawMinX: Int,
         val rawMaxX: Int,
+        val rawMinY: Int,
         val rawMaxY: Int,
         val hasPressure: Boolean,
     )
@@ -76,7 +78,9 @@ class TouchAdbController(context: Context) : AutoCloseable {
         internal fun parseTouchscreen(getevent: String): TouchscreenProbe? {
             data class Candidate(
                 var path: String = "",
+                var minX: Int? = null,
                 var maxX: Int? = null,
+                var minY: Int? = null,
                 var maxY: Int? = null,
                 var slot: Boolean = false,
                 var tracking: Boolean = false,
@@ -86,7 +90,7 @@ class TouchAdbController(context: Context) : AutoCloseable {
             val candidates = mutableListOf<Candidate>()
             var current: Candidate? = null
             val add = Regex("^add device \\d+: (\\S+)")
-            val max = Regex("max (-?\\d+)")
+            val range = Regex("min (-?\\d+), max (-?\\d+)")
             for (line in getevent.lineSequence()) {
                 val match = add.find(line)
                 if (match != null) {
@@ -97,16 +101,24 @@ class TouchAdbController(context: Context) : AutoCloseable {
                 when {
                     "ABS_MT_SLOT" in line -> c.slot = true
                     "ABS_MT_TRACKING_ID" in line -> c.tracking = true
-                    "ABS_MT_POSITION_X" in line -> c.maxX = max.find(line)?.groupValues?.get(1)?.toIntOrNull()
-                    "ABS_MT_POSITION_Y" in line -> c.maxY = max.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                    "ABS_MT_POSITION_X" in line -> range.find(line)?.let { m ->
+                        c.minX = m.groupValues[1].toIntOrNull(); c.maxX = m.groupValues[2].toIntOrNull()
+                    }
+                    "ABS_MT_POSITION_Y" in line -> range.find(line)?.let { m ->
+                        c.minY = m.groupValues[1].toIntOrNull(); c.maxY = m.groupValues[2].toIntOrNull()
+                    }
                     "ABS_MT_PRESSURE" in line -> c.pressure = true
                     "INPUT_PROP_DIRECT" in line -> c.direct = true
                 }
             }
             return candidates
-                .filter { it.path.startsWith("/dev/input/event") && it.slot && it.tracking && it.direct && (it.maxX ?: 0) > 0 && (it.maxY ?: 0) > 0 }
-                .maxByOrNull { (it.maxX ?: 0).toLong() * (it.maxY ?: 0).toLong() }
-                ?.let { TouchscreenProbe(it.path, it.maxX!!, it.maxY!!, it.pressure) }
+                .filter {
+                    it.path.startsWith("/dev/input/event") && it.slot && it.tracking && it.direct &&
+                        it.minX != null && it.maxX != null && it.minY != null && it.maxY != null &&
+                        it.maxX!! > it.minX!! && it.maxY!! > it.minY!!
+                }
+                .maxByOrNull { (it.maxX!! - it.minX!!).toLong() * (it.maxY!! - it.minY!!).toLong() }
+                ?.let { TouchscreenProbe(it.path, it.minX!!, it.maxX!!, it.minY!!, it.maxY!!, it.pressure) }
         }
 
         internal fun parseWmSize(output: String): Pair<Int, Int>? {
@@ -245,7 +257,8 @@ class TouchAdbController(context: Context) : AutoCloseable {
             append("/system/bin/app_process /system/bin ")
             append("dev.touchcompositor.shell.ShellInputService runtime-tcp ")
             append(shellQuote(t.devicePath)).append(' ')
-            append(t.rawMaxX).append(' ').append(t.rawMaxY).append(' ')
+            append(t.rawMinX).append(' ').append(t.rawMaxX).append(' ')
+            append(t.rawMinY).append(' ').append(t.rawMaxY).append(' ')
             append(probe.displayWidth).append(' ').append(probe.displayHeight).append(' ')
             append(HELPER_REMOTE).append(' ').append(probe.rotation).append(' ').append(RUNTIME_PORT).append(' ')
             append(t.hasPressure)

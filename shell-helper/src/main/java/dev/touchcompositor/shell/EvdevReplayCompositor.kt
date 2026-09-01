@@ -7,6 +7,9 @@ import java.io.PrintWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import dev.touchcompositor.input.ComposedFrame
+import dev.touchcompositor.input.DisplayGeometry
+import dev.touchcompositor.input.RawAxisRange
+import dev.touchcompositor.input.RawTouchGeometry
 import dev.touchcompositor.input.PointerOrigin
 import dev.touchcompositor.input.PointerState
 import dev.touchcompositor.input.TouchAction
@@ -17,7 +20,9 @@ import dev.touchcompositor.input.TouchAction
  */
 class EvdevReplayCompositor(
     private val devicePath: String,
+    private val rawMinX: Int,
     private val rawMaxX: Int,
+    private val rawMinY: Int,
     private val rawMaxY: Int,
     private val displayWidth: Int,
     private val displayHeight: Int,
@@ -47,6 +52,9 @@ class EvdevReplayCompositor(
         fun copyContact() = copy()
     }
 
+    private val rawGeometry = RawTouchGeometry(RawAxisRange(rawMinX, rawMaxX), RawAxisRange(rawMinY, rawMaxY))
+    private val displayGeometry = DisplayGeometry(displayWidth, displayHeight, 0)
+
     private val log = PrintWriter(FileOutputStream("/data/local/tmp/touch_compositor_replay.log", false), true)
     private val slots = linkedMapOf<Int, Contact>()
     private var previous = linkedMapOf<Int, Contact>()
@@ -65,7 +73,7 @@ class EvdevReplayCompositor(
             .redirectError(ProcessBuilder.Redirect.INHERIT)
             .start()
         Runtime.getRuntime().addShutdownHook(Thread { runCatching { process.destroy() } })
-        log.println("REPLAY_START device=$devicePath raw=${rawMaxX + 1}x${rawMaxY + 1} display=${displayWidth}x${displayHeight}")
+        log.println("REPLAY_START device=$devicePath raw=[$rawMinX,$rawMaxX]x[$rawMinY,$rawMaxY] display=${displayWidth}x${displayHeight}")
         try {
             BufferedInputStream(process.inputStream, 24 * 256).use { input ->
                 val buf = ByteArray(24)
@@ -196,8 +204,8 @@ class EvdevReplayCompositor(
             out[virtualSlot] = Contact(
                 slot = virtualSlot,
                 trackingId = 1_000_019,
-                rawX = (displayWidth * 0.78f / displayWidth * (rawMaxX + 1)).toInt(),
-                rawY = (displayHeight * 0.50f / displayHeight * (rawMaxY + 1)).toInt(),
+                rawX = (rawMinX + 0.78f * (rawMaxX - rawMinX)).toInt(),
+                rawY = (rawMinY + 0.50f * (rawMaxY - rawMinY)).toInt(),
                 major = 55,
                 minor = 52,
             )
@@ -236,8 +244,8 @@ class EvdevReplayCompositor(
             val major = c.major.coerceAtLeast(1).toFloat()
             PointerState(
                 id = c.slot,
-                x = c.rawX.toFloat() * displayWidth.toFloat() / (rawMaxX + 1).toFloat(),
-                y = c.rawY.toFloat() * displayHeight.toFloat() / (rawMaxY + 1).toFloat(),
+                x = displayGeometry.rawToScreen(c.rawX, c.rawY, rawGeometry).x,
+                y = displayGeometry.rawToScreen(c.rawX, c.rawY, rawGeometry).y,
                 pressure = (major / 31f).coerceIn(0.05f, 1f),
                 size = (major / 31f).coerceIn(0.01f, 1f),
                 touchMajor = major,
