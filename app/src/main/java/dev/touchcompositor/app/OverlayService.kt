@@ -22,6 +22,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.ScrollView
 import android.widget.TextView
 import java.text.SimpleDateFormat
@@ -42,9 +43,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     companion object {
         const val ACTION_SHOW = "dev.touchcompositor.app.SHOW_OVERLAY"
         const val ACTION_HIDE = "dev.touchcompositor.app.HIDE_OVERLAY"
-        private const val HOLD_TRIGGER_DELAY_MS = 360L
         private const val DOUBLE_TAP_MS = 240L
-        private const val PASSTHROUGH_WINDOW_ALPHA = 0.75f
     }
 
     private val io = Executors.newSingleThreadExecutor()
@@ -81,9 +80,8 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     private var runningMacroId: String? = null
     private var triggerGeometryGeneration = 0L
     @Volatile private var triggerRegionRevision = 0L
-    private val rawTriggerHoldRunnables = mutableMapOf<String, Runnable>()
     private val rawTriggerHoldStarted = mutableSetOf<String>()
-    private var entryPassthroughForMacro = false
+    private lateinit var routedWindows: RoutedOverlayWindows
 
     private val ink = Color.rgb(28, 31, 36)
     private val muted = Color.rgb(110, 116, 126)
@@ -98,6 +96,12 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         screenGeometry = LogicalScreenGeometry {
             val bounds = wm.currentWindowMetrics.bounds
             bounds.width() to bounds.height()
+        }
+        routedWindows = RoutedOverlayWindows(wm, screenGeometry, main) { command, done ->
+            io.execute {
+                val success = runCatching { if (!client.isConnected) client.connect(); client.request(command) }.isSuccess
+                main.post { done(success) }
+            }
         }
         macroStore = MacroStore(this)
         profiles = macroStore.loadProfiles()
@@ -124,6 +128,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
     override fun onDestroy() {
         serviceDestroying = true
+        routedWindows.close()
         cancelRawTriggerHolds()
         macroRunner.close()
         removeAllWindows()
@@ -173,12 +178,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             // Runtime state is ephemeral. A reconnect/restart loses raw trigger regions,
             // so always restore them from the current UI/profile state.
             syncRuntimeTriggerRegions()
+            routedWindows.sync()
         }
     }
 
     override fun onDisconnected(message: String) {
         if (serviceDestroying) return
-        main.post { runtimeStatus = "Runtime 已断开 · 正在恢复" }
+        main.post { runtimeStatus = "Runtime 已断开 · 正在恢复"; cancelRawTriggerHolds(); if (macroRunner.isRunning) macroRunner.stop(); routedWindows.suspendRouting() }
         recoverRuntime()
     }
 
@@ -212,6 +218,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                     // trigger rectangles are regenerated in the new screen space.
                     if (!recording && positionEditorView == null) syncTriggerButtons()
                 }
+                "UI_TOUCH" -> routedWindows.onTouch(parts)
                 "TRIGGER_DOWN" -> parts.getOrNull(1)?.let(::handleRawTriggerDown)
                 "TRIGGER_UP" -> parts.getOrNull(1)?.let { handleRawTriggerUp(it, cancelled = false) }
                 "TRIGGER_CANCEL" -> parts.getOrNull(1)?.let { handleRawTriggerUp(it, cancelled = true) }
@@ -225,7 +232,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         main.post {
             runningMacroId = null
             rawTriggerHoldStarted.clear()
-            setEntryPassthrough(false)
             if (error != null) runtimeStatus = "宏错误 · $error"
             refreshTriggerVisuals()
         }
@@ -246,19 +252,12 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val macro = activeProfile().macros.firstOrNull { it.id == id } ?: return
         triggerViews[id]?.background = triggerBackground(false, false)
         if (macro.trigger.mode != MacroTriggerMode.HOLD_REPEAT) return
-        rawTriggerHoldRunnables.remove(id)?.let(main::removeCallbacks)
-        val runnable = Runnable {
-            rawTriggerHoldRunnables.remove(id)
-            if (uiMode == UiMode.NONE && !macroRunner.isRunning && startMacro(macro, true, triggerViews[id])) {
-                rawTriggerHoldStarted += id
-            }
+        if (!macroRunner.isRunning && startMacro(macro, true, triggerViews[id])) {
+            rawTriggerHoldStarted += id
         }
-        rawTriggerHoldRunnables[id] = runnable
-        main.postDelayed(runnable, HOLD_TRIGGER_DELAY_MS)
     }
 
     private fun handleRawTriggerUp(id: String, cancelled: Boolean) {
-        rawTriggerHoldRunnables.remove(id)?.let(main::removeCallbacks)
         val macro = activeProfile().macros.firstOrNull { it.id == id } ?: return
         if (id in rawTriggerHoldStarted) {
             rawTriggerHoldStarted.remove(id)
@@ -294,14 +293,14 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val params = overlayParams(w, h, Gravity.TOP or Gravity.START).apply {
             x = ((resources.displayMetrics.widthPixels - w) / 2).coerceAtLeast(0)
             y = dp(2)
-            if (entryPassthroughForMacro) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+
         }
-        wm.addView(view, params)
+        routedWindows.addView(view, params)
         entryView = view
     }
 
     private fun hideEntry() {
-        entryView?.let { runCatching { wm.removeView(it) } }
+        entryView?.let { runCatching { routedWindows.removeView(it) } }
         entryView = null
     }
 
@@ -338,13 +337,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             val p = overlayParams(size, size, Gravity.TOP or Gravity.START).apply {
                 x = startX + index * (size + gap); this.y = y
             }
-            wm.addView(v, p)
+            routedWindows.addView(v, p)
             menuViews += v
         }
     }
 
     private fun hideMainMenu() {
-        menuViews.forEach { runCatching { wm.removeView(it) } }
+        menuViews.forEach { runCatching { routedWindows.removeView(it) } }
         menuViews.clear()
     }
 
@@ -434,12 +433,12 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
         val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(20))
         val p = focusableOverlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply { x = dp(10); y = dp(58) }
-        wm.addView(root, p)
+        routedWindows.addView(root, p)
         macroManagerView = root
     }
 
     private fun hideMacroManager() {
-        macroManagerView?.let { runCatching { wm.removeView(it) } }
+        macroManagerView?.let { runCatching { routedWindows.removeView(it) } }
         macroManagerView = null
     }
 
@@ -489,7 +488,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun hideTriggerButtons() {
-        triggerViews.values.forEach { runCatching { wm.removeView(it) } }
+        triggerViews.values.forEach { runCatching { routedWindows.removeView(it) } }
         triggerViews.clear()
     }
 
@@ -512,13 +511,18 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             flags = flags or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             x = (desiredCenter.x - size / 2f).roundToInt().coerceIn(0, (screenW - size).coerceAtLeast(0))
             y = (desiredCenter.y - size / 2f).roundToInt().coerceIn(0, (screenH - size).coerceAtLeast(0))
-            if (uiMode != UiMode.MACROS) {
-                flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                alpha = PASSTHROUGH_WINDOW_ALPHA
-            }
+
         }
         if (uiMode == UiMode.MACROS) installTriggerTouch(view, params, macro, size)
-        wm.addView(view, params)
+        else view.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> handleRawTriggerDown(macro.id)
+                MotionEvent.ACTION_UP -> handleRawTriggerUp(macro.id, false)
+                MotionEvent.ACTION_CANCEL -> handleRawTriggerUp(macro.id, true)
+            }
+            true
+        }
+        routedWindows.addView(view, params)
         triggerViews[macro.id] = view
         view.post {
             if (generation == triggerGeometryGeneration && view.isAttachedToWindow) {
@@ -543,7 +547,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                     downX = e.rawX; downY = e.rawY; startX = params.x; startY = params.y
                     startGlobalBounds = screenGeometry.globalBounds(view)
                     moved = false; holdStarted = false
-                    if (macro.trigger.mode == MacroTriggerMode.HOLD_REPEAT) main.postDelayed(holdRunnable, HOLD_TRIGGER_DELAY_MS)
+                    if (!editable() && macro.trigger.mode == MacroTriggerMode.HOLD_REPEAT) holdRunnable.run()
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -560,7 +564,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                                 val targetTop = (startBounds.top + dy).coerceIn(0f, (screenH - size).coerceAtLeast(0).toFloat())
                                 params.x = startX + (targetLeft - startBounds.left).roundToInt()
                                 params.y = startY + (targetTop - startBounds.top).roundToInt()
-                                runCatching { wm.updateViewLayout(view, params) }
+                                runCatching { routedWindows.updateViewLayout(view, params) }
                             }
                         }
                     }
@@ -586,13 +590,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                                     pendingSingle?.let { main.removeCallbacks(it) }; pendingSingle = null; lastTapAt = 0L; showMacroEditor(macro)
                                 } else {
                                     lastTapAt = now
-                                    if (macro.trigger.mode == MacroTriggerMode.CLICK_ONCE) {
-                                        val stamp = now
-                                        val r = Runnable {
-                                            if (lastTapAt == stamp) { lastTapAt = 0L; if (!macroRunner.isRunning) startMacro(macro, false, view) }
-                                        }
-                                        pendingSingle = r; main.postDelayed(r, DOUBLE_TAP_MS)
+                                    val stamp = now
+                                    val r = Runnable {
+                                        if (lastTapAt == stamp) { lastTapAt = 0L; showMacroEditor(macro) }
                                     }
+                                    pendingSingle = r; main.postDelayed(r, DOUBLE_TAP_MS)
                                 }
                             }
                         }
@@ -605,11 +607,9 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun startMacro(macro: TouchMacro, repeat: Boolean, source: View?): Boolean = runCatching {
-        if (uiMode == UiMode.NONE) setEntryPassthrough(true)
         macroRunner.start(macro, repeat); runningMacroId = macro.id
         source?.background = triggerBackground(uiMode == UiMode.MACROS && editingMacroId == macro.id, true); true
     }.getOrElse {
-        setEntryPassthrough(false)
         source?.background = rounded(Color.argb(205, 204, 66, 63), macro.trigger.sizeDp / 2f)
         source?.postDelayed({ source.background = triggerBackground(false, false) }, 550)
         runtimeStatus = "宏错误 · ${it.message ?: it.javaClass.simpleName}"; false
@@ -645,7 +645,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
         val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(20))
         val p = focusableOverlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply { x = dp(10); y = dp(58) }
-        wm.addView(root, p); recordingManagerView = root
+        routedWindows.addView(root, p); recordingManagerView = root
     }
 
     private fun recordingManagerRow(name: String): View {
@@ -667,7 +667,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun hideRecordingManager() {
-        recordingManagerView?.let { runCatching { wm.removeView(it) } }; recordingManagerView = null
+        recordingManagerView?.let { runCatching { routedWindows.removeView(it) } }; recordingManagerView = null
     }
 
     // Trigger-bound macro editor ----------------------------------------------
@@ -719,7 +719,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val maxH = (resources.displayMetrics.heightPixels * 0.72f).toInt()
         val scroll = MaxHeightScrollView(this).apply { maxHeightPx = maxH; addView(content, ViewGroup.LayoutParams(-1, -2)) }
         val p = focusableOverlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply { x = dp(9); y = dp(52) }
-        wm.addView(scroll, p); editorView = scroll
+        routedWindows.addView(scroll, p); editorView = scroll
     }
 
     private fun actionRow(macro: TouchMacro, index: Int, action: MacroAction): View {
@@ -751,7 +751,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 addView(parameterRow("拖动时间", "${action.durationMs} ms", { action.durationMs = (action.durationMs - 100).coerceAtLeast(50); saveProfiles(); showMacroEditor(macro) }, { action.durationMs = (action.durationMs + 100).coerceAtMost(30000); saveProfiles(); showMacroEditor(macro) }))
                 addView(compactTextButton("可视化设置起点、终点和方向") { showDragPositionEditor(macro, index) }, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(5) })
             }
-            is MacroAction.Wait -> addView(parameterRow("等待时间", "${action.durationMs} ms", { action.durationMs = (action.durationMs - 100).coerceAtLeast(0); saveProfiles(); showMacroEditor(macro) }, { action.durationMs = (action.durationMs + 100).coerceAtMost(60000); saveProfiles(); showMacroEditor(macro) }))
+            is MacroAction.Wait -> addView(waitDurationSlider(macro, action))
             is MacroAction.Recording -> {
                 addView(parameterRow("播放速度", "${trimSpeed(action.speed)} ×", { action.speed = (action.speed / 2f).coerceAtLeast(0.25f); saveProfiles(); showMacroEditor(macro) }, { action.speed = (action.speed * 2f).coerceAtMost(8f); saveProfiles(); showMacroEditor(macro) }))
                 addView(compactTextButton("更换录制动作 · ${recordingLabel(action.recordingName)}") { showRecordingPicker(macro, index) }, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(5) })
@@ -759,7 +759,34 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         }
     }
 
-    private fun hideMacroEditor() { editorView?.let { runCatching { wm.removeView(it) } }; editorView = null }
+    private fun waitDurationSlider(macro: TouchMacro, action: MacroAction.Wait): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        val label = sectionLabel("等待时间 · ${action.durationMs} ms")
+        addView(label, LinearLayout.LayoutParams(-1, dp(32)))
+        addView(SeekBar(this@OverlayService).apply {
+            max = 1000
+            progress = action.durationMs.coerceIn(0L, 1000L).toInt()
+            keyProgressIncrement = 1
+            contentDescription = "等待时间，0 到 1000 毫秒"
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    action.durationMs = value.toLong()
+                    label.text = "等待时间 · $value ms"
+                    saveProfiles()
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) {
+                    bar.parent.requestDisallowInterceptTouchEvent(true)
+                }
+                override fun onStopTrackingTouch(bar: SeekBar) {
+                    bar.parent.requestDisallowInterceptTouchEvent(false)
+                    showMacroEditor(macro)
+                }
+            })
+        }, LinearLayout.LayoutParams(-1, dp(44)))
+    }
+
+    private fun hideMacroEditor() { editorView?.let { runCatching { routedWindows.removeView(it) } }; editorView = null }
     private fun closeMacroEditor() { hideMacroEditor(); hideRecordingPicker(); editingMacroId = null; selectedActionIndex = null; syncTriggerButtons() }
     private fun resizeTrigger(macro: TouchMacro, delta: Float) { macro.trigger.sizeDp = (macro.trigger.sizeDp + delta).coerceIn(28f, 96f); saveProfiles(); syncTriggerButtons(); showMacroEditor(macro) }
     private fun deleteMacro(macro: TouchMacro) {
@@ -792,11 +819,11 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             root.addView(MaxHeightScrollView(this).apply { maxHeightPx = dp(320); addView(list, ViewGroup.LayoutParams(-1, -2)) }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
             val width = minOf(dp(320), resources.displayMetrics.widthPixels - dp(24))
             val p = focusableOverlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {}
-            wm.addView(root, p); recordingPickerView = root
+            routedWindows.addView(root, p); recordingPickerView = root
         }
     }
 
-    private fun hideRecordingPicker() { recordingPickerView?.let { runCatching { wm.removeView(it) } }; recordingPickerView = null }
+    private fun hideRecordingPicker() { recordingPickerView?.let { runCatching { routedWindows.removeView(it) } }; recordingPickerView = null }
 
     private fun showNameEditor(title: String, initial: String, onSave: (String) -> Unit) {
         hideNameEditor()
@@ -808,10 +835,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         actions.addView(compactTextButton("保存") { val value = input.text.toString().trim(); if (value.isNotEmpty()) onSave(value); hideNameEditor() }, LinearLayout.LayoutParams(0, dp(40), 1f))
         root.addView(actions, LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(7) })
         val p = focusableOverlayParams(minOf(dp(300), resources.displayMetrics.widthPixels - dp(24)), WindowManager.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
-        wm.addView(root, p); nameEditorView = root
+        routedWindows.addView(root, p); nameEditorView = root
     }
 
-    private fun hideNameEditor() { nameEditorView?.let { runCatching { wm.removeView(it) } }; nameEditorView = null }
+    private fun hideNameEditor() { nameEditorView?.let { runCatching { routedWindows.removeView(it) } }; nameEditorView = null }
 
     // Visual tap/drag position editor -----------------------------------------
 
@@ -876,7 +903,10 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             setTextColor(Color.WHITE); background = rounded(Color.argb(205, 52, 103, 215), 23f)
             elevation = dp(7).toFloat()
         }
-        val startHandle = makeHandle(if (end == null) "点" else "起")
+        // The tap target is drawn by the guide; keep a larger invisible drag hit area.
+        val startHandle: View = if (end == null) View(this).apply {
+            contentDescription = "拖动点击靶心"
+        } else makeHandle("起")
         val endHandle = if (end != null) makeHandle("终") else null
         root.addView(startHandle, FrameLayout.LayoutParams(handleSize, handleSize))
         if (endHandle != null) root.addView(endHandle, FrameLayout.LayoutParams(handleSize, handleSize))
@@ -941,13 +971,13 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
         val params = overlayParams(-1, -1, Gravity.TOP or Gravity.START).apply {
             flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         }
-        wm.addView(root, params)
+        routedWindows.addView(root, params)
         positionEditorView = root
         root.post { update() }
     }
 
     private fun removePositionEditor() {
-        positionEditorView?.let { runCatching { wm.removeView(it) } }
+        positionEditorView?.let { runCatching { routedWindows.removeView(it) } }
         positionEditorView = null
     }
 
@@ -965,7 +995,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             setOnClickListener { if (recording) stopOverlayRecording(name) }
         }
         val params = overlayParams(width, height, Gravity.TOP or Gravity.END).apply { x = right; y = top }
-        wm.addView(view, params)
+        routedWindows.addView(view, params)
         recordingStopView = view
         view.post {
             screenGeometry.globalBounds(view)?.let { bounds ->
@@ -997,7 +1027,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
             typeface = Typeface.DEFAULT_BOLD; background = rounded(Color.argb(198, 195, 57, 55), 17f)
             setOnClickListener { stopOverlayRecording(name) }
         }
-        wm.addView(view, overlayParams(width, height, Gravity.TOP or Gravity.END).apply { x = right; y = top })
+        routedWindows.addView(view, overlayParams(width, height, Gravity.TOP or Gravity.END).apply { x = right; y = top })
         recordingStopView = view
         view.post {
             screenGeometry.globalBounds(view)?.let { bounds ->
@@ -1007,7 +1037,7 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
     }
 
     private fun removeRecordingStop() {
-        recordingStopView?.let { runCatching { wm.removeView(it) } }
+        recordingStopView?.let { runCatching { routedWindows.removeView(it) } }
         recordingStopView = null
     }
 
@@ -1025,30 +1055,15 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
 
 
     private fun cancelRawTriggerHolds() {
-        rawTriggerHoldRunnables.values.forEach(main::removeCallbacks)
-        rawTriggerHoldRunnables.clear()
         if (rawTriggerHoldStarted.isNotEmpty()) macroRunner.stop()
         rawTriggerHoldStarted.clear()
     }
 
     private fun syncRuntimeTriggerRegions(generation: Long = triggerGeometryGeneration) {
         if (generation != triggerGeometryGeneration) return
-        val runtimeMode = uiMode == UiMode.NONE && !recording && positionEditorView == null
-        val regions = if (runtimeMode) {
-            val macros = activeProfile().macros
-            val measured = macros.mapNotNull { macro ->
-                val view = triggerViews[macro.id] ?: return@mapNotNull null
-                val bounds = screenGeometry.globalBounds(view) ?: return@mapNotNull null
-                RuntimeTriggerRegion(macro.id, bounds)
-            }
-            // Never replace a complete runtime map with a partially laid-out one.
-            // The final trigger layout callback will retry after all views are ready.
-            if (measured.size != macros.size) return
-            measured
-        } else {
-            emptyList()
-        }
-        pushRuntimeTriggerRegions(regions)
+        // Triggers now share the same physical-only routing map and z-order as UI.
+        pushRuntimeTriggerRegions(emptyList())
+        routedWindows.sync()
     }
 
     private data class RuntimeTriggerRegion(
@@ -1080,20 +1095,6 @@ class OverlayService : Service(), RuntimeClient.Listener, MacroRunner.Listener {
                 }
             }
         }
-    }
-
-    private fun setEntryPassthrough(enabled: Boolean) {
-        if (entryPassthroughForMacro == enabled) return
-        entryPassthroughForMacro = enabled
-        val view = entryView ?: return
-        val params = view.layoutParams as? WindowManager.LayoutParams ?: return
-        params.flags = if (enabled) {
-            params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        } else {
-            params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        }
-        params.alpha = if (enabled) PASSTHROUGH_WINDOW_ALPHA else 1f
-        runCatching { wm.updateViewLayout(view, params) }
     }
 
     private fun requestStatus() = requestAsync("STATUS") { runtimeStatus = it }

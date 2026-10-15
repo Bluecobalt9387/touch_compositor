@@ -16,7 +16,7 @@ object ShellInputService {
             "probe-input-api" -> probeInputApi()
             "monitor" -> monitor(args.drop(1))
             "tap" -> injectTap(args.drop(1))
-            "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: "/dev/input/event5").run()
+            "evdev" -> EvdevTouchReader(args.getOrNull(1) ?: error("evdev <device path from getevent -pl>")).run()
             "runtime" -> {
                 val a = args.drop(1)
                 require(a.size >= 9) { "runtime <event> <rawMinX> <rawMaxX> <rawMinY> <rawMaxY> <displayW> <displayH> <rotation> <grabHelper> [hasPressure]" }

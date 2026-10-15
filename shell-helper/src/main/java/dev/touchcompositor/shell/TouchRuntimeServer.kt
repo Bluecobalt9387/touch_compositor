@@ -1,5 +1,6 @@
 package dev.touchcompositor.shell
 
+import dev.touchcompositor.input.PhysicalUiRouter
 import dev.touchcompositor.input.PlaybackOptions
 import dev.touchcompositor.input.PlaybackTarget
 import dev.touchcompositor.input.RecordingMetadata
@@ -22,6 +23,7 @@ class TouchRuntimeServer(
     private val baseDisplayWidth: Int,
     private val baseDisplayHeight: Int,
     initialRotation: Int,
+    private val owner: String = "standalone",
 ) {
     companion object {
         const val DEFAULT_PORT = 28183
@@ -36,10 +38,16 @@ class TouchRuntimeServer(
     @Volatile private var serverSocket: ServerSocket? = null
     private val shuttingDown = AtomicBoolean(false)
     private var displayWatcher: DisplayStateWatcher? = null
+    private val sockets = CopyOnWriteArraySet<Socket>()
+    private val uiOwnerLock = Any()
+    @Volatile private var uiOwner: PrintWriter? = null
     private val clients = CopyOnWriteArraySet<PrintWriter>()
     @Volatile private var triggerRegionsSnapshot: List<LiveTouchEngine.TriggerRegion> = emptyList()
 
     init {
+        engine.uiEventListener = { event ->
+            broadcastEvent("UI_TOUCH ${event.target} ${event.action} ${event.x} ${event.y}")
+        }
         engine.triggerEventListener = { event ->
             broadcastEvent("TRIGGER_${event.action.name} ${event.id}")
         }
@@ -60,22 +68,33 @@ class TouchRuntimeServer(
     /** Localhost-only UI transport. One command stream may stay connected indefinitely. */
     fun runTcp(port: Int = DEFAULT_PORT) {
         require(port in 1024..65535)
-        engine.start()
-        startDisplayWatcher()
-        ServerSocket(port, 8, InetAddress.getByName("127.0.0.1")).use { server ->
-            serverSocket = server
-            println("TCP_READY host=127.0.0.1 port=$port")
-            System.out.flush()
-            while (!shuttingDown.get()) {
-                val socket = try { server.accept() } catch (_: Throwable) { break }
-                Thread({ serveSocket(socket) }, "touch-runtime-client").apply {
-                    isDaemon = true
-                    start()
+        try {
+            // Bind before grabbing the touchscreen: port conflicts must leave input alone.
+            ServerSocket(port, 8, InetAddress.getByName("127.0.0.1")).use { server ->
+                serverSocket = server
+                engine.start()
+                startDisplayWatcher()
+                println("TCP_READY host=127.0.0.1 port=$port")
+                while (!shuttingDown.get()) {
+                    val socket = try { server.accept() } catch (_: java.net.SocketException) { break }
+                    sockets += socket
+                    Thread({ serveSocket(socket) }, "touch-runtime-client").apply {
+                        isDaemon = true
+                        start()
+                    }
                 }
             }
+        } finally {
+            serverSocket = null
+            sockets.forEach { runCatching { it.close() } }
+            sockets.clear()
+            closeEngine(PrintWriter(System.out, true))
         }
-        serverSocket = null
-        closeEngine(PrintWriter(System.out, true))
+    }
+
+    fun shutdown() {
+        shuttingDown.set(true)
+        runCatching { serverSocket?.close() }
     }
 
     private fun serveSocket(socket: Socket) {
@@ -87,7 +106,11 @@ class TouchRuntimeServer(
                 ready(out)
                 serve(it.getInputStream().bufferedReader(), out)
             } finally {
+                synchronized(uiOwnerLock) {
+                    if (uiOwner === out) { uiOwner = null; engine.setUiRegions(emptyList()) }
+                }
                 clients -= out
+                sockets -= socket
             }
         }
     }
@@ -141,6 +164,20 @@ class TouchRuntimeServer(
             "RELEASE_ALL" -> {
                 engine.cancelAll()
                 ok(out, "RELEASED")
+            }
+            "UI_SET" -> {
+                val count = a.getOrNull(1)?.toIntOrNull() ?: error("UI_SET <count> [id left top right bottom ...]")
+                require(count in 0..128 && a.size == 2 + count * 5)
+                val regions = (0 until count).map { index ->
+                    val b = 2 + index * 5
+                    require(a[b].matches(Regex("[A-Za-z0-9_-]{1,80}")))
+                    val v = (1..4).map { a[b + it].toFloat().also { f -> require(f.isFinite()) } }
+                    require(v[0] <= v[2] && v[1] <= v[3])
+                    PhysicalUiRouter.Region(a[b], v[0], v[1], v[2], v[3])
+                }
+                require(regions.map { it.id }.distinct().size == regions.size)
+                synchronized(uiOwnerLock) { uiOwner = out; engine.setUiRegions(regions) }
+                ok(out, "UI_REGIONS $count")
             }
             "TRIGGER_SET" -> {
                 require(a.size >= 2) { "TRIGGER_SET <count> [id left top right bottom ...]" }
@@ -267,8 +304,7 @@ class TouchRuntimeServer(
             "STOP_PLAYBACK" -> { engine.stopPlayback(); ok(out, "STOPPING_PLAYBACK") }
             "SHUTDOWN" -> {
                 ok(out, "SHUTTING_DOWN")
-                shuttingDown.set(true)
-                runCatching { serverSocket?.close() }
+                shutdown()
                 return false
             }
             else -> error("unknown command ${a[0]}")
@@ -295,8 +331,11 @@ class TouchRuntimeServer(
         }.also { it.start() }
     }
 
-    private fun ready(out: PrintWriter) = synchronized(out) {
-        out.println("READY touch-runtime-v1 build=${RuntimeBuild.BUILD} ${engine.status()}")
+    private fun ready(out: PrintWriter) {
+        // Never acquire the engine lock while holding a writer lock: physical
+        // UI events broadcast while the engine lock is held.
+        val line = "READY touch-runtime-v1 build=${RuntimeBuild.BUILD} owner=$owner ${engine.status()}"
+        synchronized(out) { out.println(line) }
     }
 
     private fun broadcastEvent(message: String) {

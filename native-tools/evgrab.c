@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
     int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
     if (fd < 0) die("open");
     if (ioctl(fd, EVIOCGRAB, 1) < 0) die("EVIOCGRAB");
-    fprintf(stderr, "EVGRAB_READY %s timeout=%d\n", argv[1], timeout_sec);
+    fprintf(stderr, "EVGRAB_READY %s timeout=%d event_size=%zu\n", argv[1], timeout_sec, sizeof(struct input_event));
 
     struct input_event ev[64];
     for (;;) {

@@ -4,6 +4,7 @@ plugins {
 }
 
 android {
+    buildFeatures { aidl = true }
     namespace = "dev.touchcompositor.app"
     compileSdk = 35
 
@@ -11,8 +12,8 @@ android {
         applicationId = "dev.touchcompositor.app"
         minSdk = 30
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.0-beta.1"
+        versionCode = 4
+        versionName = "0.3.0-routing"
     }
 
     compileOptions {
@@ -23,7 +24,9 @@ android {
 }
 
 dependencies {
-    implementation(project(":core-adb"))
+    testImplementation("junit:junit:4.13.2")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation(project(":core-input"))
     implementation(project(":shell-helper"))
 }

@@ -70,13 +70,13 @@ class EvdevReplayCompositor(
 
     fun run() {
         val process = ProcessBuilder(grabHelperPath, devicePath, "60")
-            .redirectError(ProcessBuilder.Redirect.INHERIT)
             .start()
         Runtime.getRuntime().addShutdownHook(Thread { runCatching { process.destroy() } })
         log.println("REPLAY_START device=$devicePath raw=[$rawMinX,$rawMaxX]x[$rawMinY,$rawMaxY] display=${displayWidth}x${displayHeight}")
         try {
+            val eventSize = EvdevEventLayout.fromReady(process.errorStream.bufferedReader().readLine().orEmpty())
             BufferedInputStream(process.inputStream, 24 * 256).use { input ->
-                val buf = ByteArray(24)
+                val buf = ByteArray(eventSize)
                 while (true) {
                     var off = 0
                     while (off < buf.size) {
@@ -85,8 +85,7 @@ class EvdevReplayCompositor(
                         off += n
                     }
                     val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.long
-                    bb.long
+                    bb.position(eventSize - 8)
                     val type = bb.short.toInt() and 0xffff
                     val code = bb.short.toInt() and 0xffff
                     val value = bb.int

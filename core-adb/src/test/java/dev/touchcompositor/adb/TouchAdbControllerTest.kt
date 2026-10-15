@@ -79,6 +79,25 @@ class TouchAdbControllerTest {
     }
 
     @Test
+    fun acceptsVendorNeutralDeviceNamesAndIndentedDump() {
+        val dump = """
+              add device 8: /dev/input/event12
+                name: "goodix-touchscreen"
+                ABS_MT_SLOT : value 0, min 0, max 9
+                ABS_MT_TRACKING_ID : value 0, min 0, max 65535
+                ABS_MT_POSITION_X : value 0, min 0, max 4095
+                ABS_MT_POSITION_Y : value 0, min 0, max 8191
+                INPUT_PROP_DIRECT
+        """
+        for (name in listOf("goodix-touchscreen", "fts_ts", "sec_touchscreen", "synaptics_dsx")) {
+            val result = TouchAdbController.parseTouchscreen(dump.replace("goodix-touchscreen", name))!!
+            assertEquals("/dev/input/event12", result.devicePath)
+            assertFalse(result.hasPressure)
+        }
+        assertEquals(180, TouchAdbController.parseRotation("orientation = 2"))
+    }
+
+    @Test
     fun usesOverrideDisplaySizeAndViewportRotation() {
         assertEquals(1080 to 2400, TouchAdbController.parseWmSize("Physical size: 1260x2800\nOverride size: 1080x2400\n"))
         assertEquals(90, TouchAdbController.parseRotation("Viewport INTERNAL: displayId=0, orientation=1, logicalFrame=[0, 0, 2400, 1080]"))

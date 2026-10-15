@@ -1,5 +1,6 @@
 package dev.touchcompositor.shell
 
+import dev.touchcompositor.input.PhysicalUiRouter
 import dev.touchcompositor.input.ComposedFrame
 import dev.touchcompositor.input.PlaybackOptions
 import dev.touchcompositor.input.PlaybackResult
@@ -95,6 +96,13 @@ class LiveTouchEngine(
     data class TriggerEvent(val id: String, val action: TriggerAction)
     private data class ConsumedTrigger(val id: String, val trackingId: Int)
 
+    private val uiRouter = PhysicalUiRouter()
+    @Volatile var uiEventListener: ((PhysicalUiRouter.Event) -> Unit)? = null
+
+    fun setUiRegions(regions: List<PhysicalUiRouter.Region>) = synchronized(lock) {
+        uiRouter.setRegions(regions).forEach { uiEventListener?.invoke(it) }
+    }
+
     @Volatile var triggerEventListener: ((TriggerEvent) -> Unit)? = null
 
     override val capabilities = TouchCapabilities(
@@ -147,11 +155,12 @@ class LiveTouchEngine(
         check(running.compareAndSet(false, true)) { "touch engine already running" }
         val child = ProcessBuilder(grabHelperPath, devicePath, "0").start()
         process = child
-        try {
+        val eventSize = try {
             val ready = child.errorStream.bufferedReader().readLine()
             check(ready?.startsWith("EVGRAB_READY ") == true) {
                 "grab helper failed to start: ${ready ?: "no status"}"
             }
+            EvdevEventLayout.fromReady(ready!!)
         } catch (t: Throwable) {
             running.set(false)
             runCatching { child.destroyForcibly() }
@@ -159,17 +168,16 @@ class LiveTouchEngine(
             throw t
         }
 
-        readerThread = Thread({ readEvdev(child) }, "touch-compositor-evdev").apply {
+        readerThread = Thread({ readEvdev(child, eventSize) }, "touch-compositor-evdev").apply {
             isDaemon = true
             priority = Thread.MAX_PRIORITY
             start()
         }
     }
 
-    private fun readEvdev(child: Process) {
+    private fun readEvdev(child: Process, eventSize: Int) {
         try {
             BufferedInputStream(child.inputStream, 24 * 256).use { input ->
-                val eventSize = 24 // app_process is arm64 on supported Android devices.
                 val buf = ByteArray(eventSize)
                 while (running.get()) {
                     var off = 0
@@ -179,8 +187,7 @@ class LiveTouchEngine(
                         off += n
                     }
                     val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
-                    bb.long
-                    bb.long
+                    bb.position(eventSize - 8)
                     val type = bb.short.toInt() and 0xffff
                     val code = bb.short.toInt() and 0xffff
                     val value = bb.int
@@ -218,9 +225,13 @@ class LiveTouchEngine(
             .associateByTo(linkedMapOf()) { it.slot }
             .mapValuesTo(linkedMapOf()) { it.value.copy() }
 
+        uiRouter.update(current.values.map { raw ->
+            val point = raw.toPointerState(-1)
+            PhysicalUiRouter.Contact(raw.slot, raw.trackingId, point.x, point.y)
+        }).forEach { uiEventListener?.invoke(it) }
         updateConsumedTriggers(current)
         val replayCurrent = current
-            .filterKeys { it !in consumedTriggerSlots }
+            .filterKeys { it !in consumedTriggerSlots && !uiRouter.consumes(it) }
             .toMap(linkedMapOf())
 
         recordRawPhysical(replayCurrent, now)
@@ -289,7 +300,7 @@ class LiveTouchEngine(
 
         if (triggerRegions.isEmpty()) return
         current.forEach { (slot, raw) ->
-            if (slot in consumedTriggerSlots) return@forEach
+            if (slot in consumedTriggerSlots || uiRouter.consumes(slot)) return@forEach
             val existing = physical[slot]
             if (existing != null && existing.trackingId == raw.trackingId) return@forEach
             val logical = raw.toPointerState(-1)
@@ -345,6 +356,7 @@ class LiveTouchEngine(
             consumedTriggerSlots.values.forEach { consumed ->
                 triggerEventListener?.invoke(TriggerEvent(consumed.id, TriggerAction.CANCEL))
             }
+            uiRouter.setRegions(emptyList()).forEach { uiEventListener?.invoke(it) }
             consumedTriggerSlots.clear()
             triggerRegions.clear()
             displayGeometry = DisplayGeometry(width, height, rotation)
@@ -646,6 +658,7 @@ class LiveTouchEngine(
             consumedTriggerSlots.values.forEach { consumed ->
                 triggerEventListener?.invoke(TriggerEvent(consumed.id, TriggerAction.CANCEL))
             }
+            uiRouter.cancel().forEach { uiEventListener?.invoke(it) }
             consumedTriggerSlots.clear()
             triggerRegions.clear()
         }

@@ -31,21 +31,28 @@ class RuntimeClient(
         if (isConnected) return "READY"
         closeInternal(false)
         val s = Socket()
-        s.connect(InetSocketAddress(host, port), timeoutMs)
-        s.tcpNoDelay = true
-        val reader = s.getInputStream().bufferedReader()
-        val out = PrintWriter(s.getOutputStream().bufferedWriter(), true)
-        val ready = reader.readLine() ?: error("runtime closed before READY")
-        require(ready.startsWith("READY ")) { "unexpected runtime response: $ready" }
-        socket = s
-        writer = out
-        isConnected = true
-        readerThread = Thread({ readLoop(reader) }, "touch-runtime-ui-reader").apply {
-            isDaemon = true
-            start()
+        try {
+            s.connect(InetSocketAddress(host, port), timeoutMs)
+            s.soTimeout = timeoutMs
+            s.tcpNoDelay = true
+            val reader = s.getInputStream().bufferedReader()
+            val out = PrintWriter(s.getOutputStream().bufferedWriter(), true)
+            val ready = reader.readLine() ?: error("runtime closed before READY")
+            require(ready.startsWith("READY ")) { "unexpected runtime response: $ready" }
+            s.soTimeout = 0
+            socket = s
+            writer = out
+            isConnected = true
+            readerThread = Thread({ readLoop(reader, s) }, "touch-runtime-ui-reader").apply {
+                isDaemon = true
+                start()
+            }
+            listener?.onConnected(ready)
+            return ready
+        } catch (t: Throwable) {
+            runCatching { s.close() }
+            throw t
         }
-        listener?.onConnected(ready)
-        return ready
     }
 
     @Synchronized
@@ -55,13 +62,17 @@ class RuntimeClient(
         val out = writer ?: error("runtime writer missing")
         out.println(command)
         check(!out.checkError()) { "failed to send command" }
-        val line = responses.poll(timeoutMs, TimeUnit.MILLISECONDS) ?: error("runtime response timeout")
+        val line = responses.poll(timeoutMs, TimeUnit.MILLISECONDS) ?: run {
+            // The protocol has no request IDs; a late reply must not satisfy the next command.
+            closeInternal(true)
+            error("runtime response timeout")
+        }
         if (line.startsWith("ERR ")) error(line.removePrefix("ERR "))
         require(line.startsWith("OK ")) { "unexpected response: $line" }
         return line.removePrefix("OK ")
     }
 
-    private fun readLoop(reader: BufferedReader) {
+    private fun readLoop(reader: BufferedReader, source: Socket) {
         var reason = "runtime disconnected"
         try {
             while (true) {
@@ -75,8 +86,12 @@ class RuntimeClient(
         } catch (t: Throwable) {
             reason = t.message ?: t.javaClass.simpleName
         } finally {
-            closeInternal(false)
-            listener?.onDisconnected(reason)
+            synchronized(this) {
+                if (socket === source) {
+                    closeInternal(false)
+                    listener?.onDisconnected(reason)
+                }
+            }
         }
     }
 

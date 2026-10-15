@@ -20,7 +20,7 @@ class MacroGeometryGuideView(context: Context) : View(context) {
         strokeCap = Paint.Cap.ROUND
     }
     private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(75, 52, 103, 215)
+        color = Color.argb(240, 52, 103, 215)
         strokeWidth = 1.5f * density
         style = Paint.Style.STROKE
     }
@@ -39,8 +39,9 @@ class MacroGeometryGuideView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!arrowEnabled) {
-            val r = 30f * density
+            val r = 10f * density
             canvas.drawCircle(x1, y1, r, haloPaint)
+            canvas.drawCircle(x1, y1, 3f * density, haloPaint)
             canvas.drawLine(x1 - r * 1.25f, y1, x1 + r * 1.25f, y1, haloPaint)
             canvas.drawLine(x1, y1 - r * 1.25f, x1, y1 + r * 1.25f, haloPaint)
             return

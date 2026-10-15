@@ -16,6 +16,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "touch_compositor"
-include(":app", ":core-adb", ":core-input", ":shell-helper")
+include(":app", ":core-input", ":shell-helper")
 
 include(":hidden-api-stubs")

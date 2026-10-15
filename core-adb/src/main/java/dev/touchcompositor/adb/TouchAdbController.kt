@@ -92,7 +92,7 @@ class TouchAdbController(context: Context) : AutoCloseable {
             val add = Regex("^add device \\d+: (\\S+)")
             val range = Regex("min (-?\\d+), max (-?\\d+)")
             for (line in getevent.lineSequence()) {
-                val match = add.find(line)
+                val match = add.find(line.trimStart())
                 if (match != null) {
                     current = Candidate(path = match.groupValues[1]).also(candidates::add)
                     continue
@@ -128,7 +128,7 @@ class TouchAdbController(context: Context) : AutoCloseable {
         }
 
         internal fun parseRotation(viewport: String): Int {
-            val orientation = Regex("orientation=(\\d)").find(viewport)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val orientation = Regex("orientation\\s*=\\s*([0-3])").find(viewport)?.groupValues?.get(1)?.toIntOrNull() ?: 0
             return when (orientation and 3) { 1 -> 90; 2 -> 180; 3 -> 270; else -> 0 }
         }
     }
@@ -168,6 +168,7 @@ class TouchAdbController(context: Context) : AutoCloseable {
         return if (port in 1..65535) Endpoint(host, port) else null
     }
 
+    @Synchronized
     fun pair(endpoint: Endpoint, code: String): Result<Unit> = runCatching {
         require(code.matches(Regex("\\d{6}"))) { "配对码必须是 6 位数字" }
         manager.disconnectQuietly()
@@ -184,6 +185,7 @@ class TouchAdbController(context: Context) : AutoCloseable {
     }
 
     /** Connect to the current wireless-debugging transport. */
+    @Synchronized
     fun connect(endpoint: Endpoint? = null, discoveryTimeoutMs: Long = 4500): Result<Endpoint?> = runCatching {
         if (manager.isConnected) return@runCatching endpoint ?: savedConnectEndpoint() ?: connectRef.get()
         val candidates = buildList {

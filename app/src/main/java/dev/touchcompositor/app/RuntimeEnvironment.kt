@@ -1,136 +1,103 @@
 package dev.touchcompositor.app
 
+import android.content.ComponentName
 import android.content.Context
-import android.os.Build
-import dev.touchcompositor.adb.TouchAdbController
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.IBinder
+import android.os.Looper
 import dev.touchcompositor.shell.RuntimeBuild
-import java.io.File
+import rikka.shizuku.Shizuku
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
-/** Bridges product setup (ADB pairing) to the localhost touch runtime. */
+/** Process-scoped Shizuku connection shared by the activity and floating tools. */
 class RuntimeEnvironment(context: Context) : AutoCloseable {
     companion object {
-        @Volatile private var sharedAdb: TouchAdbController? = null
-        private fun controller(context: Context): TouchAdbController =
-            sharedAdb ?: synchronized(this) {
-                sharedAdb ?: TouchAdbController(context.applicationContext).also {
-                    it.startDiscovery()
-                    sharedAdb = it
-                }
+        private val lock = Any()
+        @Volatile private var service: ITouchService? = null
+        private var binding: ServiceConnection? = null
+        val available: Boolean get() = Shizuku.pingBinder()
+        val authorized: Boolean get() = available && runCatching {
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+    }
+    data class Ready(val readyLine: String, val launchedNow: Boolean)
+    private val app = context.applicationContext
+    private val args get() = Shizuku.UserServiceArgs(ComponentName(app, ShizukuTouchService::class.java))
+        .daemon(false).processNameSuffix("touch_service").version(RuntimeBuild.BUILD)
+
+    fun ensureReady(): Result<Ready> = runCatching {
+        check(Looper.myLooper() != Looper.getMainLooper()) { "请在后台启动运行环境" }
+        synchronized(lock) {
+            check(available) { "请先在 Shizuku 中启动服务" }
+            check(authorized) { "请授权 Touch Compositor 使用 Shizuku" }
+            check(Shizuku.getVersion() >= 13) { "请更新 Shizuku 至 v13 或更新版本" }
+            val remote = connectService()
+            val owner = remote.identity()
+            checkExistingRuntime(owner)?.let { return@synchronized Ready(it, false) }
+            remote.start()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(8)
+            while (System.nanoTime() < deadline) {
+                checkExistingRuntime(owner)?.let { return@synchronized Ready(it, true) }
+                val state = remote.status()
+                check(!state.startsWith("failed:") && state != "stopped") { state }
+                Thread.sleep(100)
             }
-    }
-
-    data class Ready(
-        val readyLine: String,
-        val launchedNow: Boolean,
-        val adbEndpoint: TouchAdbController.Endpoint?,
-    )
-
-    private val appContext = context.applicationContext
-    private val adb = controller(appContext)
-
-    val hasPairedIdentity: Boolean get() = adb.hasPairedIdentity
-    fun discoverySnapshot(): TouchAdbController.DiscoverySnapshot = adb.discoverySnapshot()
-    fun savedConnectEndpoint(): TouchAdbController.Endpoint? = adb.savedConnectEndpoint()
-
-    fun pairAndStart(pairingEndpoint: TouchAdbController.Endpoint, code: String): Result<Ready> = runCatching {
-        adb.pair(pairingEndpoint, code).getOrThrow()
-        // Give adbd a moment to publish/refresh _adb-tls-connect after pairing.
-        Thread.sleep(180)
-        ensureReady().getOrThrow()
-    }
-
-    fun ensureReady(manualConnect: TouchAdbController.Endpoint? = null): Result<Ready> = runCatching {
-        checkExistingRuntime()?.let { return@runCatching Ready(it, false, null) }
-        check(adb.hasPairedIdentity) { "尚未完成无线调试配对" }
-
-        val endpoint = adb.connect(manualConnect, discoveryTimeoutMs = 5_500).getOrThrow()
-        val helper = extractHelperForCurrentDevice()
-        adb.launchRuntime(appContext.packageName, helper).getOrThrow()
-        val ready = waitForRuntime(4_500)
-            ?: error(buildRuntimeStartError())
-        Ready(ready, true, endpoint)
+            error("触控服务启动超时：${remote.status()}")
+        }
     }
 
     fun restart(): Result<Ready> = runCatching {
-        val client = RuntimeClient()
+        synchronized(lock) {
+            RuntimeClient().use { client ->
+                runCatching { client.connect(450); client.request("SHUTDOWN", 1000) }
+            }
+            // Wait for the engine to release the hardware before starting again.
+            val remote = service
+            if (remote != null) {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4)
+                while (remote.status().let { it != "stopped" && !it.startsWith("failed:") && it != "idle" }) {
+                    check(System.nanoTime() < deadline) { "旧触控服务尚未停止，请在 Shizuku 中重新启动服务" }
+                    Thread.sleep(100)
+                }
+            }
+            ensureReady().getOrThrow()
+        }
+    }
+
+    private fun connectService(): ITouchService {
+        service?.takeIf { it.asBinder().pingBinder() }?.let { return it }
+        binding?.let { runCatching { Shizuku.unbindUserService(args, it, false) } }
+        val latch = CountDownLatch(1)
+        var connected: ITouchService? = null
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                connected = ITouchService.Stub.asInterface(binder)
+                latch.countDown()
+            }
+            override fun onServiceDisconnected(name: ComponentName) { service = null }
+        }
+        binding = connection
         try {
-            client.connect(450)
-            runCatching { client.request("SHUTDOWN", 900) }
-        } catch (_: Throwable) {
-        } finally {
-            client.close()
-        }
-        Thread.sleep(120)
-        ensureReady().getOrThrow()
-    }
-
-    fun forgetPairing() {
-        adb.forgetPairing()
-    }
-
-    private fun checkExistingRuntime(): String? {
-        val client = RuntimeClient()
-        return try {
-            val ready = client.connect(450)
-            if (isExpectedRuntime(ready)) {
-                ready
-            } else {
-                runCatching { client.request("SHUTDOWN", 900) }
-                Thread.sleep(100)
-                null
-            }
-        } catch (_: Throwable) {
-            null
-        } finally {
-            client.close()
+            Shizuku.bindUserService(args, connection)
+            check(latch.await(10, TimeUnit.SECONDS)) { "Shizuku 触控服务连接超时，请重试" }
+            return checkNotNull(connected).also { service = it }
+        } catch (t: Throwable) {
+            runCatching { Shizuku.unbindUserService(args, connection, true) }
+            binding = null
+            throw t
         }
     }
 
-    private fun waitForRuntime(timeoutMs: Long): String? {
-        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-        while (System.nanoTime() < deadline) {
-            val client = RuntimeClient()
-            try {
-                val ready = client.connect(350)
-                if (isExpectedRuntime(ready)) return ready
-                runCatching { client.request("SHUTDOWN", 800) }
-            } catch (_: Throwable) {
-                // Startup is asynchronous; retry until deadline.
-            } finally {
-                client.close()
-            }
-            Thread.sleep(120)
-        }
-        return null
+    private fun checkExistingRuntime(owner: String): String? = RuntimeClient().use { client ->
+        runCatching {
+            val ready = client.connect(400)
+            if (ready.startsWith("READY touch-runtime-v1 ") && ready.split(' ').containsAll(listOf("build=${RuntimeBuild.BUILD}", "owner=$owner"))) ready
+            else { client.request("SHUTDOWN", 900); Thread.sleep(250); null }
+        }.getOrNull()
     }
 
-    private fun isExpectedRuntime(ready: String): Boolean =
-        ready.startsWith("READY touch-runtime-v1 ") && ready.contains("build=${RuntimeBuild.BUILD}")
-
-    private fun extractHelperForCurrentDevice(): File {
-        val asset = helperAssetName(Build.SUPPORTED_ABIS.firstOrNull().orEmpty())
-        val target = File(appContext.cacheDir, asset)
-        appContext.assets.open(asset).use { input ->
-            val bytes = input.readBytes()
-            if (!target.isFile || target.length() != bytes.size.toLong()) target.writeBytes(bytes)
-        }
-        return target
-    }
-
-    private fun helperAssetName(abi: String): String = when (abi) {
-        "arm64-v8a" -> "tc_evgrab_arm64"
-        "armeabi-v7a", "armeabi" -> "tc_evgrab_armv7"
-        "x86_64" -> "tc_evgrab_x86_64"
-        "x86" -> "tc_evgrab_x86"
-        else -> error("暂不支持设备架构：${abi.ifBlank { "unknown" }}")
-    }
-
-    private fun buildRuntimeStartError(): String {
-        val log = adb.runtimeLog().trim().takeLast(700)
-        return if (log.isBlank()) "Touch Runtime 启动超时" else "Touch Runtime 启动失败：$log"
-    }
-
-    // The ADB connection owns the runtime shell stream and is process-scoped.
-    // Individual Activity/Service wrappers must not tear it down.
+    // Individual UI wrappers do not own the process-scoped UserService.
     override fun close() = Unit
 }

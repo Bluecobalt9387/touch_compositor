@@ -15,6 +15,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     compileOnly(project(":hidden-api-stubs"))
     implementation(project(":core-input"))
 }

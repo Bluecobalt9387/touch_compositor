@@ -29,13 +29,15 @@ class CoordinateProbeActivity : Activity() {
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         val value = String.format(
             Locale.US,
-            "TOUCH action=%d raw=%.2f,%.2f local=%.2f,%.2f",
+            "TOUCH action=%d raw=%.2f,%.2f local=%.2f,%.2f pointers=%d",
             event.actionMasked,
             event.rawX,
             event.rawY,
             event.x,
             event.y,
+            event.pointerCount,
         )
+        android.util.Log.i("TouchProbe", value)
         label.text = value
         label.contentDescription = value
         return true
